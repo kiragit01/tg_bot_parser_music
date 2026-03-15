@@ -1,5 +1,100 @@
 use serde::{Deserialize, Serialize};
 
+/// Платформа-источник трека.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Platform {
+    YandexMusic,
+    Vk,
+    SoundCloud,
+    YouTube,
+}
+
+impl Platform {
+    pub fn emoji(self) -> &'static str {
+        match self {
+            Platform::YandexMusic => "🟡",
+            Platform::Vk => "🟣",
+            Platform::SoundCloud => "🟠",
+            Platform::YouTube => "🔴",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Platform::YandexMusic => "YM",
+            Platform::Vk => "VK",
+            Platform::SoundCloud => "SC",
+            Platform::YouTube => "YT",
+        }
+    }
+
+    pub fn full_name(self) -> &'static str {
+        match self {
+            Platform::YandexMusic => "Яндекс.Музыка",
+            Platform::Vk => "VK Music",
+            Platform::SoundCloud => "SoundCloud",
+            Platform::YouTube => "YouTube",
+        }
+    }
+}
+
+/// Результат поиска с любой платформы.
+#[derive(Debug, Clone)]
+pub struct SearchResult {
+    pub platform: Platform,
+    pub title: String,
+    pub artist: String,
+    pub duration_sec: Option<u32>,
+    /// Ключ для скачивания: YM track_id, VK audio URL, SC/YT video URL.
+    pub download_key: String,
+}
+
+impl SearchResult {
+    /// Форматированная длительность (m:ss).
+    pub fn duration_display(&self) -> String {
+        match self.duration_sec {
+            Some(s) => format!("{}:{:02}", s / 60, s % 60),
+            None => "—:——".to_string(),
+        }
+    }
+
+    /// Строка для списка результатов: "🟡 Artist — Title (3:42) — YM"
+    pub fn display_line(&self, idx: usize) -> String {
+        format!(
+            "{}. {} {} — {} ({}) — {}",
+            idx,
+            self.platform.emoji(),
+            html_escape(&self.artist),
+            html_escape(&self.title),
+            self.duration_display(),
+            self.platform.label(),
+        )
+    }
+
+    /// Короткий label для inline-кнопки.
+    pub fn button_label(&self, idx: usize) -> String {
+        let raw = format!(
+            "{} {}. {} — {}",
+            self.platform.emoji(),
+            idx,
+            self.artist,
+            self.title,
+        );
+        // Telegram callback button label — ограничиваем для читаемости
+        truncate_display(&raw, 55)
+    }
+}
+
+/// Обрезает строку до max_chars символов (не байтов).
+fn truncate_display(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(max_chars - 1).collect();
+        format!("{truncated}…")
+    }
+}
+
 /// Один трек.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Track {
@@ -107,7 +202,7 @@ impl Playlist {
     }
 }
 
-fn html_escape(s: &str) -> String {
+pub fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")

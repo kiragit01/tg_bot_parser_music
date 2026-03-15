@@ -8,7 +8,7 @@ use tokio::process::Command;
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 
-use crate::models::Track;
+use crate::models::{Platform, SearchResult, Track};
 use crate::vk;
 use crate::ym;
 
@@ -103,7 +103,6 @@ async fn download_via_ytdlp(track: &Track, output_path: &PathBuf, search_prefix:
         "--ffmpeg-location".to_string(), ffmpeg_bin().to_string_lossy().to_string(),
         "--no-playlist".to_string(),
         "--no-warnings".to_string(),
-        "--no-check-certificates".to_string(),
         "-o".to_string(), output_path.to_string_lossy().to_string(),
     ];
 
@@ -154,22 +153,24 @@ async fn download_auto(track: &Track, output_path: &PathBuf) -> Result<&'static 
     if ym::is_available() {
         match ym::search_and_download(track, output_path).await {
             Ok(()) => return Ok("YM"),
-            Err(e) => log::debug!("YM не сработал для {}: {e:#}", track.search_query()),
+            Err(e) => log::warn!("YM не сработал для {}: {e:#}", track.search_query()),
         }
     }
 
     // 2. SoundCloud
     match download_via_ytdlp(track, output_path, "scsearch1").await {
         Ok(()) => return Ok("SC"),
-        Err(e) => log::debug!("SC не сработал для {}: {e:#}", track.search_query()),
+        Err(e) => log::warn!("SC не сработал для {}: {e:#}", track.search_query()),
     }
 
     // 3. VK (если токен есть)
     if let Some(token) = vk_token() {
         match download_from_vk(&token, track, output_path).await {
             Ok(()) => return Ok("VK"),
-            Err(e) => log::debug!("VK не сработал для {}: {e:#}", track.search_query()),
+            Err(e) => log::warn!("VK не сработал для {}: {e:#}", track.search_query()),
         }
+    } else {
+        log::warn!("VK пропущен: VK_TOKEN не найден");
     }
 
     // 4. YouTube (финальный fallback)
@@ -276,9 +277,10 @@ pub async fn find_and_send_track_with_source(
         bail!("Отменено");
     }
 
-    let audio_bytes = fs::read(&output_path)
+    let audio_bytes: bytes::Bytes = fs::read(&output_path)
         .await
-        .context("Не удалось прочитать скачанный файл")?;
+        .context("Не удалось прочитать скачанный файл")?
+        .into();
 
     if audio_bytes.len() > 50 * 1024 * 1024 {
         fs::remove_file(&output_path).await.ok();
@@ -302,25 +304,68 @@ pub async fn find_and_send_track_with_source(
     Ok(())
 }
 
-/// Скачивает обложку трека (ЯМ → yt-dlp thumbnail).
-async fn fetch_thumbnail(track: &Track) -> Option<Vec<u8>> {
-    // Пробуем ЯМ
+/// Скачивает обложку трека. Приоритет: ЯМ → yt-dlp thumbnail.
+pub async fn fetch_thumbnail(track: &Track) -> Option<bytes::Bytes> {
+    // 1. Пробуем ЯМ (лучшее качество обложек)
     if ym::is_available() {
-        if let Ok(results) = ym::search_tracks(&track.search_query(), 1).await {
-            if let Some(r) = results.first() {
-                if let Some(ref cover) = r.cover_url {
-                    if let Ok(resp) = reqwest::get(cover).await {
-                        if let Ok(bytes) = resp.bytes().await {
-                            if !bytes.is_empty() {
-                                return Some(bytes.to_vec());
-                            }
-                        }
-                    }
-                }
-            }
+        if let Some(bytes) = fetch_cover_from_ym(&track.search_query()).await {
+            return Some(bytes);
         }
     }
+
+    // 2. Fallback: yt-dlp --get-thumbnail
+    if let Some(bytes) = fetch_cover_from_ytdlp(&track.search_query()).await {
+        return Some(bytes);
+    }
+
     None
+}
+
+/// Скачивает обложку по поисковому запросу (для callback).
+pub async fn fetch_thumbnail_by_query(query: &str) -> Option<bytes::Bytes> {
+    if ym::is_available() {
+        if let Some(bytes) = fetch_cover_from_ym(query).await {
+            return Some(bytes);
+        }
+    }
+    fetch_cover_from_ytdlp(query).await
+}
+
+/// Обложка из Яндекс.Музыки.
+async fn fetch_cover_from_ym(query: &str) -> Option<bytes::Bytes> {
+    let results = ym::search_tracks(query, 1).await.ok()?;
+    let r = results.first()?;
+    let cover = r.cover_url.as_ref()?;
+    let resp = reqwest::get(cover).await.ok()?;
+    let bytes = resp.bytes().await.ok()?;
+    if bytes.is_empty() { None } else { Some(bytes) }
+}
+
+/// Обложка через yt-dlp (YouTube/SoundCloud thumbnail URL).
+async fn fetch_cover_from_ytdlp(query: &str) -> Option<bytes::Bytes> {
+    let output = Command::new(ytdlp_bin())
+        .args([
+            "--get-thumbnail",
+            "--default-search", "ytsearch1",
+            "--no-warnings",
+            query,
+        ])
+        .output()
+        .await
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if url.is_empty() || !url.starts_with("http") {
+        return None;
+    }
+
+    let resp = reqwest::get(&url).await.ok()?;
+    let bytes = resp.bytes().await.ok()?;
+    if bytes.is_empty() { None } else { Some(bytes) }
 }
 
 /// Отправка аудио с ожиданием rate limit.
@@ -328,9 +373,9 @@ async fn send_audio_with_rate_limit(
     bot: &Bot,
     chat_id: ChatId,
     track: &Track,
-    audio_bytes: Vec<u8>,
+    audio_bytes: bytes::Bytes,
     filename: &str,
-    thumbnail: Option<Vec<u8>>,
+    thumbnail: Option<bytes::Bytes>,
 ) -> Result<()> {
     for attempt in 0..3 {
         wait_for_rate_limit().await;
@@ -422,7 +467,144 @@ pub async fn find_and_send_with_retry_source(
     }
 }
 
-fn sanitize_filename(name: &str) -> String {
+/// Ищет метаданные через yt-dlp без скачивания (для SC/YT).
+/// `search_prefix` — "sc" или "yt", `limit` — сколько результатов вернуть.
+pub async fn search_ytdlp_metadata(query: &str, search_prefix: &str, limit: usize) -> Result<Vec<SearchResult>> {
+    let is_sc = search_prefix.starts_with("sc");
+    let platform = if is_sc { Platform::SoundCloud } else { Platform::YouTube };
+
+    // SC: запрашиваем больше — часть будет 30с превью, отфильтруем.
+    let fetch_count = if is_sc { limit + 4 } else { limit };
+    let search_term = format!("{search_prefix}search{fetch_count}:{query}");
+
+    let mut args = vec![
+        "--dump-json".to_string(),
+        "--no-download".to_string(),
+        "--flat-playlist".to_string(),
+        "--no-warnings".to_string(),
+    ];
+
+    if has_cookies() {
+        args.push("--cookies".to_string());
+        args.push(COOKIES_FILE.to_string());
+    }
+
+    // SoundCloud OAuth
+    if is_sc {
+        if let Some(token) = sc_oauth_token() {
+            args.push("--add-header".to_string());
+            args.push(format!("Authorization:OAuth {token}"));
+        }
+    }
+
+    args.push(search_term);
+
+    let output = Command::new(ytdlp_bin())
+        .args(&args)
+        .output()
+        .await
+        .context("yt-dlp metadata search")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("{}: {}", platform.label(), stderr.trim());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // yt-dlp --dump-json выводит по одному JSON-объекту на строку
+    let results: Vec<SearchResult> = stdout
+        .lines()
+        .filter_map(|line| {
+            let v: serde_json::Value = serde_json::from_str(line).ok()?;
+            let title = v["title"].as_str().unwrap_or_default().to_string();
+            if title.is_empty() {
+                return None;
+            }
+            let artist = v["artist"]
+                .as_str()
+                .or_else(|| v["uploader"].as_str())
+                .or_else(|| v["channel"].as_str())
+                .unwrap_or("")
+                .to_string();
+            let duration_sec = v["duration"].as_f64().map(|d| d as u32);
+
+            // SC: фильтруем 30с превью (Go+ треки без авторизации)
+            if is_sc {
+                if let Some(dur) = duration_sec {
+                    if dur <= 35 {
+                        log::debug!("SC: пропускаю превью ({dur}с): {artist} — {title}");
+                        return None;
+                    }
+                }
+            }
+
+            let download_key = v["webpage_url"]
+                .as_str()
+                .or_else(|| v["url"].as_str())
+                .unwrap_or_default()
+                .to_string();
+
+            if download_key.is_empty() {
+                return None;
+            }
+
+            Some(SearchResult {
+                platform,
+                title,
+                artist,
+                duration_sec,
+                download_key,
+            })
+        })
+        .take(limit)
+        .collect();
+
+    Ok(results)
+}
+
+/// Скачивает аудио по прямому URL через yt-dlp (для SC/YT результатов из поиска).
+pub async fn download_by_url(url: &str, output_path: &PathBuf) -> Result<()> {
+    if output_path.exists() {
+        fs::remove_file(output_path).await.ok();
+    }
+
+    let mut args = vec![
+        "-x".to_string(),
+        "--audio-format".to_string(), "mp3".to_string(),
+        "--audio-quality".to_string(), "5".to_string(),
+        "--ffmpeg-location".to_string(), ffmpeg_bin().to_string_lossy().to_string(),
+        "--no-playlist".to_string(),
+        "--no-warnings".to_string(),
+        "-o".to_string(), output_path.to_string_lossy().to_string(),
+    ];
+
+    if has_cookies() {
+        args.push("--cookies".to_string());
+        args.push(COOKIES_FILE.to_string());
+    }
+
+    args.push(url.to_string());
+
+    let output = Command::new(ytdlp_bin())
+        .args(&args)
+        .output()
+        .await
+        .context("yt-dlp download by URL")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("yt-dlp URL: {}", stderr.trim());
+    }
+
+    if !output_path.exists() {
+        bail!("yt-dlp: файл не создан для {url}");
+    }
+
+    Ok(())
+}
+
+pub fn sanitize_filename(name: &str) -> String {
     name.chars()
         .map(|c| match c {
             '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',

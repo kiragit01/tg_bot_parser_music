@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 
 use teloxide::prelude::*;
 use teloxide::types::{
@@ -13,26 +13,45 @@ use tokio_util::sync::CancellationToken;
 
 use crate::commands::Command;
 use crate::downloader::{self, Source};
-use crate::models::{Playlist, Track};
+use crate::models::{html_escape, Platform, Playlist, SearchResult, Track};
 use crate::yandex;
 
 type HandlerResult = ResponseResult<()>;
 
-/// Плейлисты per-chat.
-static PLAYLISTS: Mutex<Option<HashMap<ChatId, Playlist>>> = Mutex::const_new(None);
+/// Закешированный username бота (заполняется при старте).
+static BOT_USERNAME: OnceLock<String> = OnceLock::new();
+
+pub fn set_bot_username(username: String) {
+    BOT_USERNAME.set(username).ok();
+}
+
+fn bot_username() -> &'static str {
+    BOT_USERNAME.get().map(|s| s.as_str()).unwrap_or("")
+}
+
+/// Плейлисты per-chat (с ограничением размера).
+static PLAYLISTS: LazyLock<Mutex<HashMap<ChatId, Arc<Playlist>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Кеш результатов поиска per-chat (для callback-кнопок).
+static SEARCH_CACHE: LazyLock<Mutex<HashMap<ChatId, Vec<SearchResult>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Токены отмены per-chat.
-static CANCEL_TOKENS: Mutex<Option<HashMap<ChatId, CancellationToken>>> = Mutex::const_new(None);
+static CANCEL_TOKENS: LazyLock<Mutex<HashMap<ChatId, CancellationToken>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Глобальный лимит одновременных скачиваний.
 static GLOBAL_SEMAPHORE: LazyLock<Semaphore> = LazyLock::new(|| {
     Semaphore::new(global_max_concurrent())
 });
 
+/// Макс. плейлистов в кеше.
+const MAX_CACHED_PLAYLISTS: usize = 100;
+
 async fn set_cancel_token(chat_id: ChatId) -> CancellationToken {
     let token = CancellationToken::new();
     let mut map = CANCEL_TOKENS.lock().await;
-    let map = map.get_or_insert_with(HashMap::new);
     // Отменяем предыдущую задачу если была
     if let Some(old) = map.insert(chat_id, token.clone()) {
         old.cancel();
@@ -42,30 +61,44 @@ async fn set_cancel_token(chat_id: ChatId) -> CancellationToken {
 
 async fn cancel_download(chat_id: ChatId) -> bool {
     let mut map = CANCEL_TOKENS.lock().await;
-    if let Some(map) = map.as_mut() {
-        if let Some(token) = map.remove(&chat_id) {
-            token.cancel();
-            return true;
-        }
+    if let Some(token) = map.remove(&chat_id) {
+        token.cancel();
+        return true;
     }
     false
 }
 
 async fn clear_cancel_token(chat_id: ChatId) {
-    let mut map = CANCEL_TOKENS.lock().await;
-    if let Some(map) = map.as_mut() {
-        map.remove(&chat_id);
-    }
+    CANCEL_TOKENS.lock().await.remove(&chat_id);
 }
 
 async fn save_playlist(chat_id: ChatId, playlist: Playlist) {
     let mut map = PLAYLISTS.lock().await;
-    let map = map.get_or_insert_with(HashMap::new);
-    map.insert(chat_id, playlist);
+    // LRU-подобная очистка: если кеш переполнен, удаляем случайный
+    if map.len() >= MAX_CACHED_PLAYLISTS && !map.contains_key(&chat_id) {
+        if let Some(&old_key) = map.keys().next() {
+            map.remove(&old_key);
+        }
+    }
+    map.insert(chat_id, Arc::new(playlist));
 }
 
-async fn get_playlist(chat_id: ChatId) -> Option<Playlist> {
-    PLAYLISTS.lock().await.as_ref()?.get(&chat_id).cloned()
+async fn get_playlist(chat_id: ChatId) -> Option<Arc<Playlist>> {
+    PLAYLISTS.lock().await.get(&chat_id).cloned()
+}
+
+async fn save_search_results(chat_id: ChatId, results: Vec<SearchResult>) {
+    let mut map = SEARCH_CACHE.lock().await;
+    if map.len() >= MAX_CACHED_PLAYLISTS && !map.contains_key(&chat_id) {
+        if let Some(&old_key) = map.keys().next() {
+            map.remove(&old_key);
+        }
+    }
+    map.insert(chat_id, results);
+}
+
+async fn get_search_result(chat_id: ChatId, index: usize) -> Option<SearchResult> {
+    SEARCH_CACHE.lock().await.get(&chat_id).and_then(|v| v.get(index).cloned())
 }
 
 const PROGRESS_EVERY: usize = 10;
@@ -76,12 +109,6 @@ fn global_max_concurrent() -> usize {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(10)
-}
-
-fn html_escape_str(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
 }
 
 /// Форматирует информацию о пользователе для логов.
@@ -122,8 +149,7 @@ pub async fn process_message(bot: Bot, msg: Message) -> HandlerResult {
     };
 
     // Пробуем распарсить как команду
-    let me = bot.get_me().await?;
-    if let Ok(cmd) = Command::parse(text, me.username()) {
+    if let Ok(cmd) = Command::parse(text, bot_username()) {
         log::info!("[CMD] {} -> {:?}", user_tag(&msg), cmd);
         return handle_command(&bot, &msg, cmd).await;
     }
@@ -222,8 +248,13 @@ async fn handle_command(bot: &Bot, msg: &Message, cmd: Command) -> HandlerResult
         }
 
         Command::Status => {
-            bot.send_message(msg.chat.id, "📊 Нет активных задач.")
-                .await?;
+            let has_active = CANCEL_TOKENS.lock().await.contains_key(&msg.chat.id);
+            let status_msg = if has_active {
+                "📊 Скачивание в процессе. Остановить: /stop"
+            } else {
+                "📊 Нет активных задач."
+            };
+            bot.send_message(msg.chat.id, status_msg).await?;
         }
     }
 
@@ -392,8 +423,6 @@ async fn download_tracks_parallel_source(
                 }
             }
 
-            drop(_permit);
-
             // Не шлём прогресс если уже отменено
             if cancel.is_cancelled() {
                 cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -420,7 +449,7 @@ async fn download_tracks_parallel_source(
     let was_cancelled = cancelled.load(std::sync::atomic::Ordering::Relaxed);
     let failed_list = failed.lock().await;
     let completed = done.load(std::sync::atomic::Ordering::Relaxed);
-    let ok_count = completed - failed_list.len();
+    let ok_count = completed.saturating_sub(failed_list.len());
 
     if was_cancelled {
         let summary = format!("⏹ Остановлено. Скачано: {ok_count}/{total}");
@@ -429,7 +458,7 @@ async fn download_tracks_parallel_source(
             let items: String = failed_list
                 .iter()
                 .enumerate()
-                .map(|(i, name)| format!("{}. {}", i + 1, html_escape_str(name)))
+                .map(|(i, name)| format!("{}. {}", i + 1, html_escape(name)))
                 .collect::<Vec<_>>()
                 .join("\n");
             let msg = format!(
@@ -450,7 +479,7 @@ async fn download_tracks_parallel_source(
         let items: String = failed_list
             .iter()
             .enumerate()
-            .map(|(i, name)| format!("{}. {}", i + 1, html_escape_str(name)))
+            .map(|(i, name)| format!("{}. {}", i + 1, html_escape(name)))
             .collect::<Vec<_>>()
             .join("\n");
 
@@ -561,55 +590,35 @@ async fn handle_get_track(bot: &Bot, msg: &Message, query: &str) -> HandlerResul
     };
 
     let search_q = track.search_query();
-    bot.send_message(msg.chat.id, format!("🔍 Ищу: {search_q}"))
+    bot.send_message(msg.chat.id, format!("🔍 Ищу на всех платформах: {search_q}"))
         .await?;
 
-    // Собираем результаты со всех доступных платформ
-    let mut text = String::new();
-    let mut buttons: Vec<Vec<InlineKeyboardButton>> = Vec::new();
-    let mut idx = 0usize;
+    // Параллельный поиск на всех доступных платформах
+    let search_q_ref = &search_q;
+    let (ym_res, vk_res, sc_res, yt_res) = tokio::join!(
+        search_ym(search_q_ref),
+        search_vk(search_q_ref),
+        async {
+            downloader::search_ytdlp_metadata(search_q_ref, "sc", 2)
+                .await
+                .unwrap_or_default()
+        },
+        async {
+            downloader::search_ytdlp_metadata(search_q_ref, "yt", 2)
+                .await
+                .unwrap_or_default()
+        },
+    );
 
-    // ЯМ
-    if downloader::ym_available() {
-        if let Ok(results) = crate::ym::search_tracks(&search_q, 3).await {
-            for r in &results {
-                idx += 1;
-                let dur = format_duration_ms(r.duration_ms);
-                let album_str = r.album.as_deref().map(|a| format!(" — {a}")).unwrap_or_default();
-                text.push_str(&format!(
-                    "{}. 🟡 {} — {}{} {}\n",
-                    idx,
-                    html_escape_str(&r.artist),
-                    html_escape_str(&r.title),
-                    html_escape_str(&album_str),
-                    dur,
-                ));
-                // Telegram callback_data max 64 bytes, track_id usually short
-                let label = truncate_str(&format!("🟡 {} — {}", r.artist, r.title), 60);
-                buttons.push(vec![
-                    InlineKeyboardButton::callback(label, format!("get:ym:{}", r.track_id)),
-                ]);
-            }
-        }
-    }
+    // Собираем все результаты в единый список
+    let mut all_results: Vec<SearchResult> = Vec::new();
+    all_results.extend(ym_res);
+    all_results.extend(vk_res);
+    all_results.extend(sc_res);
+    all_results.extend(yt_res);
 
-    // Всегда кнопка авто-поиска (SC → YT)
-    buttons.push(vec![
-        InlineKeyboardButton::callback(
-            auto_search_label(),
-            format!("get:auto:{}", truncate_str(&search_q, 50)),
-        ),
-    ]);
-
-    if idx > 0 {
-        let header = format!("🎵 Найдено ({idx}):\n\n");
-        let keyboard = InlineKeyboardMarkup::new(buttons);
-        bot.send_message(msg.chat.id, format!("{header}{text}"))
-            .parse_mode(teloxide::types::ParseMode::Html)
-            .reply_markup(keyboard)
-            .await?;
-    } else {
-        // Ничего не нашли через поиск — качаем автоматом
+    if all_results.is_empty() {
+        // Ничего не нашли — качаем автоматом
         match downloader::find_and_send_with_retry(bot, msg.chat.id, &track).await {
             Ok(()) => {
                 bot.send_message(msg.chat.id, "✅ Отправлен!").await?;
@@ -618,20 +627,88 @@ async fn handle_get_track(bot: &Bot, msg: &Message, query: &str) -> HandlerResul
                 bot.send_message(msg.chat.id, format!("❌ {e}")).await?;
             }
         }
+        return Ok(());
     }
+
+    // Формируем текст и кнопки
+    let count = all_results.len();
+    let mut text = format!("🎵 Найдено ({count}):\n\n");
+    let mut buttons: Vec<Vec<InlineKeyboardButton>> = Vec::new();
+
+    for (i, result) in all_results.iter().enumerate() {
+        let idx = i + 1;
+        text.push_str(&result.display_line(idx));
+        text.push('\n');
+        buttons.push(vec![InlineKeyboardButton::callback(
+            result.button_label(idx),
+            format!("s:{i}"),
+        )]);
+    }
+
+    // Кнопка авто-поиска
+    buttons.push(vec![InlineKeyboardButton::callback(
+        auto_search_label(),
+        format!("get:auto:{}", truncate_str(&search_q, 50)),
+    )]);
+
+    // Сохраняем результаты в кеш для callback
+    save_search_results(msg.chat.id, all_results).await;
+
+    let keyboard = InlineKeyboardMarkup::new(buttons);
+    bot.send_message(msg.chat.id, text)
+        .parse_mode(teloxide::types::ParseMode::Html)
+        .reply_markup(keyboard)
+        .await?;
 
     Ok(())
 }
 
-fn format_duration_ms(ms: Option<u64>) -> String {
-    match ms {
-        Some(ms) => {
-            let s = ms / 1000;
-            format!("({}:{:02})", s / 60, s % 60)
+/// Поиск в Яндекс.Музыке → Vec<SearchResult>.
+async fn search_ym(query: &str) -> Vec<SearchResult> {
+    if !downloader::ym_available() {
+        return Vec::new();
+    }
+    match crate::ym::search_tracks(query, 2).await {
+        Ok(results) => results
+            .into_iter()
+            .map(|r| SearchResult {
+                platform: Platform::YandexMusic,
+                title: r.title,
+                artist: r.artist,
+                duration_sec: r.duration_ms.map(|ms| (ms / 1000) as u32),
+                download_key: r.track_id,
+            })
+            .collect(),
+        Err(e) => {
+            log::debug!("YM поиск: {e:#}");
+            Vec::new()
         }
-        None => String::new(),
     }
 }
+
+/// Поиск в VK → Vec<SearchResult>.
+async fn search_vk(query: &str) -> Vec<SearchResult> {
+    let Some(token) = std::env::var("VK_TOKEN").ok().filter(|t| !t.is_empty()) else {
+        return Vec::new();
+    };
+    match crate::vk::search_tracks(&token, query, 2).await {
+        Ok(results) => results
+            .into_iter()
+            .map(|a| SearchResult {
+                platform: Platform::Vk,
+                title: a.title,
+                artist: a.artist,
+                duration_sec: Some(a.duration),
+                download_key: a.url,
+            })
+            .collect(),
+        Err(e) => {
+            log::debug!("VK поиск: {e:#}");
+            Vec::new()
+        }
+    }
+}
+
 
 fn auto_search_label() -> &'static str {
     match (downloader::ym_available(), downloader::vk_available()) {
@@ -747,47 +824,107 @@ pub async fn process_callback(bot: Bot, q: CallbackQuery) -> HandlerResult {
         return Ok(());
     }
 
-    // Обработка выбора трека: "get:<source>:<track_id_or_query>"
+    // Обработка выбора из поиска: "s:<index>"
+    if parts[0] == "s" {
+        bot.answer_callback_query(q.id.clone()).await?;
+        let _ = bot.edit_message_reply_markup(chat_id, msg_id).await;
+
+        let Ok(index) = parts[1].parse::<usize>() else {
+            return Ok(());
+        };
+
+        let Some(result) = get_search_result(chat_id, index).await else {
+            bot.send_message(chat_id, "❌ Результат не найден. Попробуй поиск заново.")
+                .await?;
+            return Ok(());
+        };
+
+        let platform_name = result.platform.full_name();
+        bot.send_message(
+            chat_id,
+            format!("⏳ Скачиваю из {}...", platform_name),
+        )
+        .await?;
+
+        let safe_name = downloader::sanitize_filename(&format!(
+            "{} - {}",
+            result.artist, result.title
+        ));
+        let output_path = PathBuf::from("downloads").join(format!("{safe_name}.mp3"));
+
+        let download_result = match result.platform {
+            Platform::YandexMusic => {
+                crate::ym::download_track(&result.download_key, &output_path).await
+            }
+            Platform::Vk => {
+                match crate::vk::download_audio(&result.download_key).await {
+                    Ok(bytes) => {
+                        if bytes.is_empty() {
+                            Err(anyhow::anyhow!("VK: пустой файл"))
+                        } else {
+                            tokio::fs::write(&output_path, &bytes)
+                                .await
+                                .map_err(|e| anyhow::anyhow!("Запись файла: {e}"))
+                        }
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            Platform::SoundCloud | Platform::YouTube => {
+                downloader::download_by_url(&result.download_key, &output_path).await
+            }
+        };
+
+        match download_result {
+            Ok(()) => {
+                let audio_bytes = tokio::fs::read(&output_path).await.unwrap_or_default();
+                if !audio_bytes.is_empty() {
+                    let input_file = teloxide::types::InputFile::memory(audio_bytes)
+                        .file_name(format!("{safe_name}.mp3"));
+                    let mut req = bot.send_audio(chat_id, input_file)
+                        .title(&result.title)
+                        .performer(&result.artist);
+
+                    // Обложка — пробуем для всех платформ (YM → yt-dlp fallback)
+                    let cover_query = format!("{} - {}", result.artist, result.title);
+                    if let Some(thumb) = downloader::fetch_thumbnail_by_query(&cover_query).await {
+                        req = req.thumbnail(
+                            teloxide::types::InputFile::memory(thumb)
+                                .file_name("cover.jpg"),
+                        );
+                    }
+
+                    let _ = req.await;
+                }
+                tokio::fs::remove_file(&output_path).await.ok();
+                bot.send_message(chat_id, "✅ Отправлен!").await?;
+            }
+            Err(e) => {
+                tokio::fs::remove_file(&output_path).await.ok();
+                bot.send_message(chat_id, format!("❌ {e}")).await?;
+            }
+        }
+        return Ok(());
+    }
+
+    // Обработка авто-поиска: "get:auto:<query>"
     if parts[0] == "get" && parts.len() == 3 {
         bot.answer_callback_query(q.id.clone()).await?;
         let _ = bot.edit_message_reply_markup(chat_id, msg_id).await;
 
-        let source_key = parts[1];
         let value = parts[2];
-
-        if source_key == "ym" {
-            // Скачиваем конкретный трек из ЯМ по ID
-            bot.send_message(chat_id, "⏳ Скачиваю из Яндекс.Музыки...").await?;
-            let output_path = PathBuf::from("downloads").join(format!("{value}.mp3"));
-            match crate::ym::download_track(value, &output_path).await {
-                Ok(()) => {
-                    let bytes = tokio::fs::read(&output_path).await.unwrap_or_default();
-                    if !bytes.is_empty() {
-                        let input_file = teloxide::types::InputFile::memory(bytes)
-                            .file_name(format!("{value}.mp3"));
-                        let _ = bot.send_audio(chat_id, input_file).await;
-                    }
-                    tokio::fs::remove_file(&output_path).await.ok();
-                    bot.send_message(chat_id, "✅ Отправлен!").await?;
-                }
-                Err(e) => {
-                    bot.send_message(chat_id, format!("❌ {e}")).await?;
-                }
-            }
+        let track = if let Some(t) = yandex::parse_track_text(value) {
+            t
         } else {
-            // Авто-поиск
-            let track = if let Some(t) = yandex::parse_track_text(value) {
-                t
-            } else {
-                Track::new("", value)
-            };
-            match downloader::find_and_send_with_retry(&bot, chat_id, &track).await {
-                Ok(()) => {
-                    bot.send_message(chat_id, "✅ Отправлен!").await?;
-                }
-                Err(e) => {
-                    bot.send_message(chat_id, format!("❌ {e}")).await?;
-                }
+            Track::new("", value)
+        };
+        bot.send_message(chat_id, "⏳ Авто-поиск...").await?;
+        match downloader::find_and_send_with_retry(&bot, chat_id, &track).await {
+            Ok(()) => {
+                bot.send_message(chat_id, "✅ Отправлен!").await?;
+            }
+            Err(e) => {
+                bot.send_message(chat_id, format!("❌ {e}")).await?;
             }
         }
         return Ok(());

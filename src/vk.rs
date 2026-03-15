@@ -1,3 +1,5 @@
+use std::sync::LazyLock;
+
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
@@ -9,6 +11,15 @@ const VK_API_VERSION: &str = "5.95";
 // User-Agent Kate Mobile — без него VK блокирует доступ к аудио
 const VK_USER_AGENT: &str =
     "KateMobileAndroid/95 lite-523 (Android 13; SDK 33; arm64-v8a; Xiaomi M2101K6G; ru)";
+
+/// Глобальный HTTP-клиент для VK API.
+static VK_HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .user_agent(VK_USER_AGENT)
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("reqwest client")
+});
 
 #[derive(Deserialize)]
 struct VkResponse {
@@ -27,6 +38,7 @@ struct VkAudioResponse {
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 pub struct VkAudio {
     pub url: String,
     pub artist: String,
@@ -34,22 +46,15 @@ pub struct VkAudio {
     pub duration: u32,
 }
 
-fn vk_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .user_agent(VK_USER_AGENT)
-        .build()
-        .expect("reqwest client")
-}
+/// Ищет треки через VK API, возвращает до `limit` результатов с непустыми URL.
+pub async fn search_tracks(token: &str, query: &str, limit: usize) -> Result<Vec<VkAudio>> {
+    let count = (limit + 3).min(10).to_string(); // запрашиваем чуть больше — часть без URL
 
-/// Ищет трек через VK API.
-pub async fn search_track(token: &str, track: &Track) -> Result<VkAudio> {
-    let query = track.search_query();
-
-    let resp = vk_client()
+    let resp = VK_HTTP
         .get(format!("{VK_API_URL}/audio.search"))
         .query(&[
-            ("q", query.as_str()),
-            ("count", "5"),
+            ("q", query),
+            ("count", count.as_str()),
             ("access_token", token),
             ("v", VK_API_VERSION),
         ])
@@ -65,21 +70,28 @@ pub async fn search_track(token: &str, track: &Track) -> Result<VkAudio> {
 
     let items = vk.response.context("Пустой ответ VK API")?.items;
 
-    if items.is_empty() {
-        bail!("Не найден в VK: {}", track.search_query());
-    }
-
-    let audio = items
+    let results: Vec<VkAudio> = items
         .into_iter()
-        .find(|a| !a.url.is_empty())
-        .context(format!("VK: все результаты без URL для {}", track.search_query()))?;
+        .filter(|a| !a.url.is_empty())
+        .take(limit)
+        .collect();
 
-    Ok(audio)
+    Ok(results)
+}
+
+/// Ищет один трек через VK API (обратная совместимость).
+pub async fn search_track(token: &str, track: &Track) -> Result<VkAudio> {
+    let query = track.search_query();
+    let results = search_tracks(token, &query, 1).await?;
+    results
+        .into_iter()
+        .next()
+        .context(format!("Не найден в VK: {query}"))
 }
 
 /// Скачивает mp3 по прямой ссылке из VK.
 pub async fn download_audio(url: &str) -> Result<Vec<u8>> {
-    let bytes = vk_client()
+    let bytes = VK_HTTP
         .get(url)
         .send()
         .await

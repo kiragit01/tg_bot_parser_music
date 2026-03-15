@@ -1,8 +1,27 @@
+use std::sync::LazyLock;
+
 use anyhow::{Context, Result, bail};
 use regex::Regex;
 use scraper::{Html, Selector};
 
 use crate::models::{Playlist, Track};
+
+/// Предкомпилированные регулярные выражения.
+static RE_IFRAME: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"iframe/playlist/([^/\s"]+)/(\d+)"#).unwrap());
+static RE_LEGACY: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"users/([^/]+)/playlists/(\d+)"#).unwrap());
+static RE_UUID: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"music\.yandex\.\w+/playlists/([0-9a-f-]+)"#).unwrap());
+
+/// Глобальный HTTP-клиент.
+static HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .user_agent(UA)
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("reqwest client")
+});
 
 /// Проверяет, является ли текст URL/embed на Яндекс.Музыку.
 pub fn is_yandex_music_url(text: &str) -> bool {
@@ -22,8 +41,7 @@ enum PlaylistInput {
 /// Определяет тип входных данных.
 fn classify_input(text: &str) -> Result<PlaylistInput> {
     // Iframe embed: ищем src="...iframe/playlist/{owner}/{id}"
-    let iframe_re = Regex::new(r#"iframe/playlist/([^/\s"]+)/(\d+)"#).unwrap();
-    if let Some(caps) = iframe_re.captures(text) {
+    if let Some(caps) = RE_IFRAME.captures(text) {
         return Ok(PlaylistInput::Iframe {
             owner: caps[1].to_string(),
             playlist_id: caps[2].to_string(),
@@ -31,8 +49,7 @@ fn classify_input(text: &str) -> Result<PlaylistInput> {
     }
 
     // Старый формат: /users/{owner}/playlists/{id}
-    let legacy_re = Regex::new(r#"users/([^/]+)/playlists/(\d+)"#).unwrap();
-    if let Some(caps) = legacy_re.captures(text) {
+    if let Some(caps) = RE_LEGACY.captures(text) {
         return Ok(PlaylistInput::Legacy {
             owner: caps[1].to_string(),
             playlist_id: caps[2].to_string(),
@@ -40,8 +57,7 @@ fn classify_input(text: &str) -> Result<PlaylistInput> {
     }
 
     // UUID формат: /playlists/{uuid}
-    let uuid_re = Regex::new(r#"music\.yandex\.\w+/playlists/([0-9a-f-]+)"#).unwrap();
-    if let Some(caps) = uuid_re.captures(text) {
+    if let Some(caps) = RE_UUID.captures(text) {
         let uuid = &caps[1];
         return Ok(PlaylistInput::Uuid {
             url: format!("https://music.yandex.ru/playlists/{uuid}"),
@@ -102,21 +118,15 @@ pub async fn parse_playlist(text: &str) -> Result<Playlist> {
 
 /// Пытается извлечь треки из UUID-страницы.
 async fn resolve_uuid_playlist(url: &str) -> Result<Playlist> {
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::limited(5))
-        .build()?;
-
-    let response = client
+    let response = HTTP
         .get(url)
-        .header("User-Agent", UA)
         .send()
         .await
         .context("Не удалось загрузить страницу")?;
 
     // Проверяем, не редиректнуло ли на старый формат
     let final_url = response.url().to_string();
-    let legacy_re = Regex::new(r#"users/([^/]+)/playlists/(\d+)"#).unwrap();
-    if let Some(caps) = legacy_re.captures(&final_url) {
+    if let Some(caps) = RE_LEGACY.captures(&final_url) {
         let owner = caps[1].to_string();
         let playlist_id = caps[2].to_string();
         return parse_via_json_api(&owner, &playlist_id).await;
@@ -125,15 +135,14 @@ async fn resolve_uuid_playlist(url: &str) -> Result<Playlist> {
     let html_text = response.text().await?;
 
     // Ищем iframe src или ссылки с owner/id внутри HTML (до создания Html, чтобы не держать !Send через .await)
-    let iframe_re = Regex::new(r#"iframe/playlist/([^/\s"]+)/(\d+)"#).unwrap();
-    if let Some(caps) = iframe_re.captures(&html_text) {
+    if let Some(caps) = RE_IFRAME.captures(&html_text) {
         let owner = caps[1].to_string();
         let playlist_id = caps[2].to_string();
         return parse_via_json_api(&owner, &playlist_id).await;
     }
 
     // Ищем owner/playlists в любом месте HTML
-    if let Some(caps) = legacy_re.captures(&html_text) {
+    if let Some(caps) = RE_LEGACY.captures(&html_text) {
         let owner = caps[1].to_string();
         let playlist_id = caps[2].to_string();
         return parse_via_json_api(&owner, &playlist_id).await;
@@ -163,11 +172,9 @@ async fn parse_via_json_api(owner: &str, playlist_id: &str) -> Result<Playlist> 
         "https://music.yandex.ru/handlers/playlist.jsx?owner={owner}&kinds={playlist_id}"
     );
 
-    let client = reqwest::Client::new();
-    let response = client
+    let response = HTTP
         .get(&url)
         .header("Accept", "application/json")
-        .header("User-Agent", UA)
         .header("X-Retpath-Y", "https://music.yandex.ru")
         .send()
         .await
@@ -202,10 +209,8 @@ async fn parse_via_json_api(owner: &str, playlist_id: &str) -> Result<Playlist> 
 
 /// Парсинг через HTML-скрейпинг.
 async fn parse_via_html(url: &str) -> Result<Playlist> {
-    let client = reqwest::Client::new();
-    let html_text = client
+    let html_text = HTTP
         .get(url)
-        .header("User-Agent", UA)
         .send()
         .await
         .context("Загрузка страницы")?

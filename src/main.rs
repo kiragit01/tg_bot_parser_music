@@ -38,8 +38,9 @@ fn setup_logger() {
     let console = fern::Dispatch::new()
         .chain(std::io::stdout());
 
-    // Файл — всё (для анализа потом)
+    // Файл — только warn/error (для анализа проблем)
     let file = fern::Dispatch::new()
+        .level(log::LevelFilter::Warn)
         .format(|out, message, record| {
             out.finish(format_args!(
                 "{} [{}] [{}] {}",
@@ -70,6 +71,12 @@ async fn main() {
     log::info!("yt-dlp инициализирован");
 
     let bot = Bot::from_env();
+
+    // Кешируем username бота один раз при старте
+    let me = bot.get_me().await.expect("Не удалось получить информацию о боте");
+    let bot_username = me.username.clone().unwrap_or_default();
+    handlers::set_bot_username(bot_username);
+    log::info!("Бот: @{}", me.username.as_deref().unwrap_or("?"));
 
     let handler = dptree::entry()
         .branch(
