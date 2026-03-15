@@ -33,11 +33,21 @@ impl Track {
         }
     }
 
-    /// Форматирование для отображения пользователю.
+    /// Форматирование для отображения пользователю (plain text).
     pub fn display(&self) -> String {
         match &self.album {
             Some(album) => format!("🎵 {} — {} ({})", self.artist, self.title, album),
             None => format!("🎵 {} — {}", self.artist, self.title),
+        }
+    }
+
+    /// Форматирование с HTML-экранированием.
+    pub fn display_html(&self) -> String {
+        let artist = html_escape(&self.artist);
+        let title = html_escape(&self.title);
+        match &self.album {
+            Some(album) => format!("🎵 {} — {} ({})", artist, title, html_escape(album)),
+            None => format!("🎵 {} — {}", artist, title),
         }
     }
 }
@@ -70,15 +80,15 @@ impl Playlist {
         self.tracks.is_empty()
     }
 
-    /// Разбивает список треков на страницы для Telegram (лимит 4096 символов).
+    /// Разбивает список треков на страницы, обёрнутые в expandable blockquote (HTML).
     pub fn format_pages(&self, page_size: usize) -> Vec<String> {
         self.tracks
             .chunks(page_size)
             .enumerate()
             .map(|(chunk_idx, chunk)| {
                 let header = match &self.title {
-                    Some(t) => format!("📋 {} (стр. {})\n\n", t, chunk_idx + 1),
-                    None => format!("📋 Плейлист (стр. {})\n\n", chunk_idx + 1),
+                    Some(t) => format!("📋 {} (стр. {})\n", html_escape(t), chunk_idx + 1),
+                    None => format!("📋 Плейлист (стр. {})\n", chunk_idx + 1),
                 };
 
                 let tracks_text: String = chunk
@@ -86,13 +96,19 @@ impl Playlist {
                     .enumerate()
                     .map(|(i, track)| {
                         let global_idx = chunk_idx * page_size + i + 1;
-                        format!("{}. {}", global_idx, track.display())
+                        format!("{}. {}", global_idx, track.display_html())
                     })
                     .collect::<Vec<_>>()
                     .join("\n");
 
-                format!("{}{}", header, tracks_text)
+                format!("{}<blockquote expandable>{}</blockquote>", header, tracks_text)
             })
             .collect()
     }
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }

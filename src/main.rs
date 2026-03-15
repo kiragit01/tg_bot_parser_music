@@ -4,13 +4,63 @@ mod handlers;
 mod models;
 mod vk;
 mod yandex;
+mod ym;
 
 use teloxide::prelude::*;
+use teloxide::dispatching::UpdateFilterExt;
+use teloxide::types::Update;
+
+fn setup_logger() {
+    let colors = fern::colors::ColoredLevelConfig::new()
+        .info(fern::colors::Color::Green)
+        .warn(fern::colors::Color::Yellow)
+        .error(fern::colors::Color::Red)
+        .debug(fern::colors::Color::Cyan);
+
+    let base = fern::Dispatch::new()
+        .format(move |out, message, record| {
+            out.finish(format_args!(
+                "{} [{}] [{}] {}",
+                chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+                colors.color(record.level()),
+                record.target(),
+                message
+            ))
+        })
+        .level(log::LevelFilter::Info)
+        // Заглушаем спам от внутренних крейтов
+        .level_for("hyper", log::LevelFilter::Warn)
+        .level_for("reqwest", log::LevelFilter::Warn)
+        .level_for("teloxide", log::LevelFilter::Warn)
+        .level_for("html5ever", log::LevelFilter::Warn);
+
+    // Консоль — всё
+    let console = fern::Dispatch::new()
+        .chain(std::io::stdout());
+
+    // Файл — всё (для анализа потом)
+    let file = fern::Dispatch::new()
+        .format(|out, message, record| {
+            out.finish(format_args!(
+                "{} [{}] [{}] {}",
+                chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+                record.level(),
+                record.target(),
+                message
+            ))
+        })
+        .chain(fern::log_file("bot.log").expect("Не удалось открыть bot.log"));
+
+    base.chain(console)
+        .chain(file)
+        .apply()
+        .expect("Не удалось настроить логирование");
+}
 
 #[tokio::main]
 async fn main() {
     dotenvy::dotenv().ok();
-    pretty_env_logger::init();
+    setup_logger();
     log::info!("Запускаю ym-telegram-bot...");
 
     if let Err(e) = downloader::init().await {
@@ -21,8 +71,29 @@ async fn main() {
 
     let bot = Bot::from_env();
 
-    teloxide::repl(bot, |bot: Bot, msg: Message| async move {
-        handlers::process_message(bot, msg).await
-    })
-    .await;
+    let handler = dptree::entry()
+        .branch(
+            Update::filter_message()
+                .endpoint(|bot: Bot, msg: Message| async move {
+                    handlers::process_message(bot, msg).await
+                }),
+        )
+        .branch(
+            Update::filter_callback_query()
+                .endpoint(|bot: Bot, q: CallbackQuery| async move {
+                    handlers::process_callback(bot, q).await
+                }),
+        )
+        .branch(
+            Update::filter_inline_query()
+                .endpoint(|bot: Bot, q: InlineQuery| async move {
+                    handlers::process_inline(bot, q).await
+                }),
+        );
+
+    Dispatcher::builder(bot, handler)
+        .enable_ctrlc_handler()
+        .build()
+        .dispatch()
+        .await;
 }

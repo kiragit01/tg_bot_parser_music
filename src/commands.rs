@@ -1,7 +1,7 @@
 use teloxide::utils::command::BotCommands;
 
 /// Команды бота.
-#[derive(BotCommands, Clone)]
+#[derive(BotCommands, Clone, Debug)]
 #[command(rename_rule = "lowercase", description = "Доступные команды:")]
 pub enum Command {
     #[command(description = "Начать работу с ботом")]
@@ -18,6 +18,12 @@ pub enum Command {
 
     #[command(description = "Скачать все треки из последнего плейлиста")]
     DownloadAll,
+
+    #[command(description = "Скачать треки: /download 30-60 или 1,5,10")]
+    Download(String),
+
+    #[command(description = "Остановить скачивание")]
+    Stop,
 
     #[command(description = "Статус текущей задачи")]
     Status,
