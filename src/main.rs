@@ -1,3 +1,4 @@
+mod cache;
 mod commands;
 mod downloader;
 mod handlers;
@@ -69,6 +70,11 @@ async fn main() {
         std::process::exit(1);
     }
     log::info!("yt-dlp инициализирован");
+
+    if let Err(e) = cache::init().await {
+        log::error!("Не удалось инициализировать кеш: {e:#}");
+        std::process::exit(1);
+    }
 
     let bot = Bot::from_env();
 

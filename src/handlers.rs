@@ -11,6 +11,7 @@ use teloxide::utils::command::BotCommands;
 use tokio::sync::{Mutex, Semaphore};
 use tokio_util::sync::CancellationToken;
 
+use crate::cache;
 use crate::commands::Command;
 use crate::downloader::{self, Source};
 use crate::models::{html_escape, Platform, Playlist, SearchResult, Track};
@@ -840,6 +841,22 @@ pub async fn process_callback(bot: Bot, q: CallbackQuery) -> HandlerResult {
         };
 
         let platform_name = result.platform.full_name();
+        let cache_query = format!("{} - {}", result.artist, result.title);
+
+        // === Кеш: проверяем file_id ===
+        if let Some(cached) = cache::get(&cache_query).await {
+            match downloader::send_cached(&bot, chat_id, &cached).await {
+                Ok(()) => {
+                    log::info!("[CACHE] Отправлен из кеша: {cache_query}");
+                    bot.send_message(chat_id, "✅ Отправлен!").await?;
+                    return Ok(());
+                }
+                Err(e) => {
+                    log::warn!("Кеш не сработал: {e:#}, качаю заново");
+                }
+            }
+        }
+
         bot.send_message(
             chat_id,
             format!("⏳ Скачиваю из {}...", platform_name),
@@ -894,7 +911,25 @@ pub async fn process_callback(bot: Bot, q: CallbackQuery) -> HandlerResult {
                         );
                     }
 
-                    let _ = req.await;
+                    match req.await {
+                        Ok(msg) => {
+                            // === Кеш: сохраняем file_id ===
+                            if let Some(audio) = msg.audio() {
+                                cache::save(
+                                    &cache_query,
+                                    &audio.file.id.0,
+                                    &result.artist,
+                                    &result.title,
+                                    result.duration_sec,
+                                    result.platform.label(),
+                                )
+                                .await;
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!("Ошибка отправки аудио: {e}");
+                        }
+                    }
                 }
                 tokio::fs::remove_file(&output_path).await.ok();
                 bot.send_message(chat_id, "✅ Отправлен!").await?;

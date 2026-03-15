@@ -8,6 +8,7 @@ use tokio::process::Command;
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 
+use crate::cache;
 use crate::models::{Platform, SearchResult, Track};
 use crate::vk;
 use crate::ym;
@@ -157,8 +158,8 @@ async fn download_auto(track: &Track, output_path: &PathBuf) -> Result<&'static 
         }
     }
 
-    // 2. SoundCloud
-    match download_via_ytdlp(track, output_path, "scsearch1").await {
+    // 2. SoundCloud (пробуем до 3 результатов, пропуская превью)
+    match download_sc_with_fallback(track, output_path).await {
         Ok(()) => return Ok("SC"),
         Err(e) => log::warn!("SC не сработал для {}: {e:#}", track.search_query()),
     }
@@ -176,6 +177,45 @@ async fn download_auto(track: &Track, output_path: &PathBuf) -> Result<&'static 
     // 4. YouTube (финальный fallback)
     download_via_ytdlp(track, output_path, "ytsearch1").await?;
     Ok("YT")
+}
+
+/// SC с перебором до 3 результатов (пропускает 30с превью).
+const SC_FALLBACK_LIMIT: usize = 3;
+
+async fn download_sc_with_fallback(track: &Track, output_path: &PathBuf) -> Result<()> {
+    let results = search_ytdlp_metadata(&track.search_query(), "sc", SC_FALLBACK_LIMIT).await?;
+    if results.is_empty() {
+        bail!("SC: ничего не найдено для {}", track.search_query());
+    }
+
+    for (i, result) in results.iter().enumerate() {
+        match download_by_url(&result.download_key, output_path).await {
+            Ok(()) => {
+                // Проверяем размер — превью < 500KB
+                let meta = fs::metadata(output_path).await?;
+                if meta.len() < 500_000 {
+                    fs::remove_file(output_path).await.ok();
+                    log::debug!(
+                        "SC: результат {} — превью ({}KB), пробую следующий",
+                        i + 1,
+                        meta.len() / 1024
+                    );
+                    continue;
+                }
+                return Ok(());
+            }
+            Err(e) => {
+                log::debug!("SC: результат {} не скачался: {e}", i + 1);
+                continue;
+            }
+        }
+    }
+
+    bail!(
+        "SC: все {} результатов — превью или ошибки для {}",
+        results.len(),
+        track.search_query()
+    );
 }
 
 /// Ищет трек в VK, скачивает mp3 напрямую.
@@ -243,6 +283,24 @@ pub async fn find_and_send_track_with_source(
     source: Source,
     cancel: CancellationToken,
 ) -> Result<()> {
+    let query = track.search_query();
+
+    // === Кеш: проверяем есть ли file_id ===
+    if let Some(cached) = cache::get(&query).await {
+        if cancel.is_cancelled() {
+            bail!("Отменено");
+        }
+        match send_cached_audio(bot, chat_id, &cached).await {
+            Ok(()) => {
+                log::info!("[CACHE] Отправлен: {query}");
+                return Ok(());
+            }
+            Err(e) => {
+                log::warn!("Кеш не сработал для {query}: {e:#}, качаю заново");
+            }
+        }
+    }
+
     let filename = format!(
         "{} - {}.mp3",
         sanitize_filename(&track.artist),
@@ -296,11 +354,36 @@ pub async fn find_and_send_track_with_source(
     // Обложка — пробуем скачать
     let thumb = fetch_thumbnail(track).await;
 
-    send_audio_with_rate_limit(bot, chat_id, track, audio_bytes, &filename, thumb).await?;
+    let msg = send_audio_with_rate_limit(bot, chat_id, track, audio_bytes, &filename, thumb).await?;
 
     fs::remove_file(&output_path).await.ok();
 
-    log::info!("[{source_tag}] Отправлен: {}", track.search_query());
+    // === Кеш: сохраняем file_id ===
+    if let Some(audio) = msg.audio() {
+        cache::save(
+            &query,
+            &audio.file.id.0,
+            &track.artist,
+            &track.title,
+            track.duration_sec,
+            source_tag,
+        )
+        .await;
+    }
+
+    log::info!("[{source_tag}] Отправлен: {}", query);
+    Ok(())
+}
+
+/// Отправляет аудио из кеша по file_id.
+async fn send_cached_audio(
+    bot: &Bot,
+    chat_id: ChatId,
+    cached: &cache::CachedTrack,
+) -> Result<()> {
+    wait_for_rate_limit().await;
+    let input_file = InputFile::file_id(teloxide::types::FileId(cached.file_id.clone()));
+    bot.send_audio(chat_id, input_file).await?;
     Ok(())
 }
 
@@ -368,7 +451,7 @@ async fn fetch_cover_from_ytdlp(query: &str) -> Option<bytes::Bytes> {
     if bytes.is_empty() { None } else { Some(bytes) }
 }
 
-/// Отправка аудио с ожиданием rate limit.
+/// Отправка аудио с ожиданием rate limit. Возвращает Message (содержит file_id).
 async fn send_audio_with_rate_limit(
     bot: &Bot,
     chat_id: ChatId,
@@ -376,7 +459,7 @@ async fn send_audio_with_rate_limit(
     audio_bytes: bytes::Bytes,
     filename: &str,
     thumbnail: Option<bytes::Bytes>,
-) -> Result<()> {
+) -> Result<teloxide::types::Message> {
     for attempt in 0..3 {
         wait_for_rate_limit().await;
 
@@ -392,7 +475,7 @@ async fn send_audio_with_rate_limit(
 
         match req.await
         {
-            Ok(_) => return Ok(()),
+            Ok(msg) => return Ok(msg),
             Err(teloxide::RequestError::RetryAfter(seconds)) => {
                 let secs = seconds.seconds();
                 log::warn!(
@@ -602,6 +685,15 @@ pub async fn download_by_url(url: &str, output_path: &PathBuf) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Отправляет аудио из кеша по file_id (публичная — для handlers).
+pub async fn send_cached(
+    bot: &Bot,
+    chat_id: ChatId,
+    cached: &cache::CachedTrack,
+) -> Result<()> {
+    send_cached_audio(bot, chat_id, cached).await
 }
 
 pub fn sanitize_filename(name: &str) -> String {
