@@ -2,3 +2,6 @@
 /.env
 /downloads/
 /libs/
+/bot.log
+/Cargo.lock
+/cookies.txt
