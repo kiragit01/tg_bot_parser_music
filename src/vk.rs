@@ -90,7 +90,7 @@ pub async fn search_track(token: &str, track: &Track) -> Result<VkAudio> {
 }
 
 /// Скачивает mp3 по прямой ссылке из VK.
-pub async fn download_audio(url: &str) -> Result<Vec<u8>> {
+pub async fn download_audio(url: &str) -> Result<bytes::Bytes> {
     let bytes = VK_HTTP
         .get(url)
         .send()
@@ -100,5 +100,5 @@ pub async fn download_audio(url: &str) -> Result<Vec<u8>> {
         .await
         .context("Чтение аудио из VK")?;
 
-    Ok(bytes.to_vec())
+    Ok(bytes)
 }

@@ -24,7 +24,7 @@ async fn lyrics_keyboard(user_id: Option<u64>, query: &str) -> Option<InlineKeyb
     if !settings.show_lyrics {
         return None;
     }
-    let truncated = if query.len() > 55 { &query[..55] } else { query };
+    let truncated = if query.len() > 55 { &query[..query.floor_char_boundary(55)] } else { query };
     let cb_data = format!("lyrics:{truncated}");
     Some(InlineKeyboardMarkup::new(vec![
         vec![InlineKeyboardButton::callback("📝 Текст", cb_data)],
@@ -51,17 +51,31 @@ fn has_cookies() -> bool {
 }
 
 fn vk_token() -> Option<String> {
-    std::env::var("VK_TOKEN").ok().filter(|t| !t.is_empty())
+    crate::tokens::VK.next().map(|s| s.to_string())
 }
 
 fn sc_oauth_token() -> Option<String> {
-    std::env::var("SC_OAUTH_TOKEN").ok().filter(|t| !t.is_empty())
+    crate::tokens::SC.next().map(|s| s.to_string())
 }
 
 /// Скачивает бинарники yt-dlp и ffmpeg при первом запуске.
 pub async fn init() -> Result<()> {
     fs::create_dir_all(LIBS_DIR).await?;
     fs::create_dir_all(OUTPUT_DIR).await?;
+
+    // Очищаем старые файлы из downloads/ (остатки от предыдущих крашей)
+    if let Ok(mut entries) = fs::read_dir(OUTPUT_DIR).await {
+        let mut cleaned = 0u32;
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            if entry.path().extension().and_then(|e| e.to_str()) == Some("mp3") {
+                fs::remove_file(entry.path()).await.ok();
+                cleaned += 1;
+            }
+        }
+        if cleaned > 0 {
+            log::info!("Очищено {cleaned} старых файлов из downloads/");
+        }
+    }
 
     if !ytdlp_bin().exists() || !ffmpeg_bin().exists() {
         log::info!("Скачиваю yt-dlp и ffmpeg...");
@@ -92,12 +106,7 @@ pub async fn init() -> Result<()> {
         .context("Не удалось запустить yt-dlp")?;
     log::info!("yt-dlp версия: {}", String::from_utf8_lossy(&output.stdout).trim());
 
-    if vk_token().is_some() {
-        log::info!("VK_TOKEN найден — VK как основной источник");
-    }
-    if sc_oauth_token().is_some() {
-        log::info!("SC_OAUTH_TOKEN найден — SoundCloud с авторизацией");
-    }
+    // Статус токенов логируется из tokens::log_status()
 
     Ok(())
 }
@@ -172,24 +181,24 @@ async fn download_auto(track: &Track, output_path: &PathBuf) -> Result<&'static 
     if ym::is_available() {
         match ym::search_and_download(track, output_path).await {
             Ok(()) => return Ok("YM"),
-            Err(e) => log::warn!("YM не сработал для {}: {e:#}", track.search_query()),
+            Err(e) => log::debug!("YM не сработал для {}: {e:#}", track.search_query()),
         }
     }
 
     // 2. SoundCloud (пробуем до 3 результатов, пропуская превью)
     match download_sc_with_fallback(track, output_path).await {
         Ok(()) => return Ok("SC"),
-        Err(e) => log::warn!("SC не сработал для {}: {e:#}", track.search_query()),
+        Err(e) => log::debug!("SC не сработал для {}: {e:#}", track.search_query()),
     }
 
     // 3. VK (если токен есть)
     if let Some(token) = vk_token() {
         match download_from_vk(&token, track, output_path).await {
             Ok(()) => return Ok("VK"),
-            Err(e) => log::warn!("VK не сработал для {}: {e:#}", track.search_query()),
+            Err(e) => log::debug!("VK не сработал для {}: {e:#}", track.search_query()),
         }
     } else {
-        log::warn!("VK пропущен: VK_TOKEN не найден");
+        log::debug!("VK пропущен: VK_TOKEN не найден");
     }
 
     // 4. YouTube (финальный fallback)

@@ -28,16 +28,19 @@ pub fn is_available() -> bool {
     ym_token().is_some()
 }
 
-fn build_client() -> Result<YandexMusicClient> {
-    let token = ym_token().context("YM_TOKEN не задан")?;
-    YandexMusicClient::builder(token)
-        .build()
-        .map_err(|e| anyhow::anyhow!("Ошибка клиента ЯМ: {e}"))
+/// Кешированный клиент ЯМ (создаётся один раз).
+static YM_CLIENT: std::sync::LazyLock<Option<YandexMusicClient>> = std::sync::LazyLock::new(|| {
+    let token = ym_token()?;
+    YandexMusicClient::builder(token).build().ok()
+});
+
+fn get_client() -> Result<&'static YandexMusicClient> {
+    YM_CLIENT.as_ref().context("YM_TOKEN не задан или ошибка клиента")
 }
 
 /// Ищет треки в ЯМ, возвращает список результатов.
 pub async fn search_tracks(query: &str, limit: usize) -> Result<Vec<YmSearchResult>> {
-    let client = build_client()?;
+    let client = get_client()?;
     let opts = SearchOptions::new(query);
     let search = client
         .search(&opts)
@@ -81,7 +84,7 @@ pub async fn search_tracks(query: &str, limit: usize) -> Result<Vec<YmSearchResu
 
 /// Скачивает трек из ЯМ по track_id в output_path.
 pub async fn download_track(track_id: &str, output_path: &PathBuf) -> Result<()> {
-    let client = build_client()?;
+    let client = get_client()?;
 
     let opts = GetFileInfoOptions::new(track_id).quality(Quality::Normal);
 

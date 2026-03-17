@@ -4,6 +4,7 @@ mod downloader;
 mod handlers;
 mod lyrics;
 mod models;
+pub mod tokens;
 mod vk;
 mod yandex;
 mod ym;
@@ -85,6 +86,9 @@ async fn main() {
     let bot_username = me.username.clone().unwrap_or_default();
     handlers::set_bot_username(bot_username);
     log::info!("Бот: @{}", me.username.as_deref().unwrap_or("?"));
+
+    // Логируем статус пулов токенов
+    tokens::log_status();
 
     // Регистрируем команды в меню Telegram
     if let Err(e) = bot

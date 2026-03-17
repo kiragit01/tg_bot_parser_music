@@ -3,7 +3,7 @@ use scraper::{Html, Selector};
 const GENIUS_SEARCH_URL: &str = "https://api.genius.com/search";
 
 fn genius_token() -> Option<String> {
-    std::env::var("GENIUS_TOKEN").ok().filter(|t| !t.is_empty())
+    crate::tokens::GENIUS.next().map(|s| s.to_string())
 }
 
 /// Ищет и возвращает текст песни с Genius. Возвращает None если не найден.

@@ -775,10 +775,10 @@ async fn search_ym(query: &str) -> Vec<SearchResult> {
 
 /// Поиск в VK → Vec<SearchResult>.
 async fn search_vk(query: &str) -> Vec<SearchResult> {
-    let Some(token) = std::env::var("VK_TOKEN").ok().filter(|t| !t.is_empty()) else {
+    let Some(token) = crate::tokens::VK.next() else {
         return Vec::new();
     };
-    match crate::vk::search_tracks(&token, query, 2).await {
+    match crate::vk::search_tracks(token, query, 2).await {
         Ok(results) => results
             .into_iter()
             .map(|a| SearchResult {
@@ -1111,21 +1111,40 @@ pub async fn process_callback(bot: Bot, q: CallbackQuery) -> HandlerResult {
                 crate::ym::download_track(&result.download_key, &output_path).await
             }
             Platform::Vk => {
-                match crate::vk::download_audio(&result.download_key).await {
-                    Ok(bytes) => {
-                        if bytes.is_empty() {
-                            Err(anyhow::anyhow!("VK: пустой файл"))
-                        } else {
-                            tokio::fs::write(&output_path, &bytes)
-                                .await
-                                .map_err(|e| anyhow::anyhow!("Запись файла: {e}"))
-                        }
+                async {
+                    let url = if result.download_key.is_empty() {
+                        let search_q = format!("{} - {}", result.artist, result.title);
+                        let token = crate::tokens::VK.next()
+                            .ok_or_else(|| anyhow::anyhow!("VK_TOKEN не задан"))?;
+                        let tracks = crate::vk::search_tracks(token, &search_q, 1).await?;
+                        tracks.into_iter().next()
+                            .ok_or_else(|| anyhow::anyhow!("VK: трек не найден"))?
+                            .url
+                    } else {
+                        result.download_key.clone()
+                    };
+                    let bytes = crate::vk::download_audio(&url).await?;
+                    if bytes.is_empty() {
+                        anyhow::bail!("VK: пустой файл");
                     }
-                    Err(e) => Err(e),
-                }
+                    tokio::fs::write(&output_path, &bytes).await?;
+                    Ok(())
+                }.await
             }
             Platform::SoundCloud | Platform::YouTube => {
-                downloader::download_by_url(&result.download_key, &output_path).await
+                if result.download_key.is_empty() {
+                    // Из кеша поиска — URL нет, ищем заново
+                    let prefix = if result.platform == Platform::SoundCloud { "sc" } else { "yt" };
+                    let search_q = format!("{} - {}", result.artist, result.title);
+                    match downloader::search_ytdlp_metadata(&search_q, prefix, 1).await {
+                        Ok(results) if !results.is_empty() => {
+                            downloader::download_by_url(&results[0].download_key, &output_path).await
+                        }
+                        _ => Err(anyhow::anyhow!("Не удалось найти URL для скачивания"))
+                    }
+                } else {
+                    downloader::download_by_url(&result.download_key, &output_path).await
+                }
             }
         };
 
