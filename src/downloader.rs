@@ -8,10 +8,28 @@ use tokio::process::Command;
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 
+use teloxide::types::InlineKeyboardMarkup;
+
+use teloxide::types::InlineKeyboardButton;
+
 use crate::cache;
 use crate::models::{Platform, SearchResult, Track};
 use crate::vk;
 use crate::ym;
+
+/// Создаёт кнопку "📝 Текст" если у пользователя включены тексты.
+async fn lyrics_keyboard(user_id: Option<u64>, query: &str) -> Option<InlineKeyboardMarkup> {
+    let uid = user_id?;
+    let settings = cache::get_user_settings(uid).await;
+    if !settings.show_lyrics {
+        return None;
+    }
+    let truncated = if query.len() > 55 { &query[..55] } else { query };
+    let cb_data = format!("lyrics:{truncated}");
+    Some(InlineKeyboardMarkup::new(vec![
+        vec![InlineKeyboardButton::callback("📝 Текст", cb_data)],
+    ]))
+}
 
 /// Глобальный таймстамп, до которого нельзя слать (rate limit).
 static RATE_LIMIT_UNTIL: AtomicU64 = AtomicU64::new(0);
@@ -273,7 +291,7 @@ pub async fn find_and_send_track(
     chat_id: ChatId,
     track: &Track,
 ) -> Result<()> {
-    find_and_send_track_with_source(bot, chat_id, track, Source::Auto, CancellationToken::new(), None).await
+    find_and_send_track_with_source(bot, chat_id, track, Source::Auto, CancellationToken::new(), None, None).await
 }
 
 pub async fn find_and_send_track_with_source(
@@ -283,6 +301,7 @@ pub async fn find_and_send_track_with_source(
     source: Source,
     cancel: CancellationToken,
     thread_id: Option<ThreadId>,
+    user_id: Option<u64>,
 ) -> Result<()> {
     let query = track.search_query();
 
@@ -291,7 +310,7 @@ pub async fn find_and_send_track_with_source(
         if cancel.is_cancelled() {
             bail!("Отменено");
         }
-        match send_cached_audio(bot, chat_id, &cached, thread_id).await {
+        match send_cached_audio(bot, chat_id, &cached, thread_id, user_id, &query).await {
             Ok(()) => {
                 log::info!("[CACHE] Отправлен: {query}");
                 return Ok(());
@@ -355,7 +374,10 @@ pub async fn find_and_send_track_with_source(
     // Обложка — пробуем скачать
     let thumb = fetch_thumbnail(track).await;
 
-    let msg = send_audio_with_rate_limit(bot, chat_id, track, audio_bytes, &filename, thumb, thread_id).await?;
+    // Кнопка текста
+    let lyrics_kb = lyrics_keyboard(user_id, &query).await;
+
+    let msg = send_audio_with_rate_limit(bot, chat_id, track, audio_bytes, &filename, thumb, thread_id, lyrics_kb).await?;
 
     fs::remove_file(&output_path).await.ok();
 
@@ -382,12 +404,17 @@ async fn send_cached_audio(
     chat_id: ChatId,
     cached: &cache::CachedTrack,
     thread_id: Option<ThreadId>,
+    user_id: Option<u64>,
+    query: &str,
 ) -> Result<()> {
     wait_for_rate_limit().await;
     let input_file = InputFile::file_id(teloxide::types::FileId(cached.file_id.clone()));
     let mut req = bot.send_audio(chat_id, input_file);
     if let Some(tid) = thread_id {
         req = req.message_thread_id(tid);
+    }
+    if let Some(kb) = lyrics_keyboard(user_id, query).await {
+        req = req.reply_markup(kb);
     }
     req.await?;
     Ok(())
@@ -458,7 +485,7 @@ async fn fetch_cover_from_ytdlp(query: &str) -> Option<bytes::Bytes> {
 }
 
 /// Отправка аудио с ожиданием rate limit. Возвращает Message (содержит file_id).
-async fn send_audio_with_rate_limit(
+pub async fn send_audio_with_rate_limit(
     bot: &Bot,
     chat_id: ChatId,
     track: &Track,
@@ -466,6 +493,7 @@ async fn send_audio_with_rate_limit(
     filename: &str,
     thumbnail: Option<bytes::Bytes>,
     thread_id: Option<ThreadId>,
+    reply_markup: Option<InlineKeyboardMarkup>,
 ) -> Result<teloxide::types::Message> {
     for attempt in 0..3 {
         wait_for_rate_limit().await;
@@ -482,6 +510,10 @@ async fn send_audio_with_rate_limit(
 
         if let Some(ref thumb_bytes) = thumbnail {
             req = req.thumbnail(InputFile::memory(thumb_bytes.clone()).file_name("cover.jpg"));
+        }
+
+        if let Some(ref kb) = reply_markup {
+            req = req.reply_markup(kb.clone());
         }
 
         match req.await
@@ -532,7 +564,7 @@ pub async fn find_and_send_with_retry(
     chat_id: ChatId,
     track: &Track,
 ) -> Result<()> {
-    find_and_send_with_retry_source(bot, chat_id, track, Source::Auto, CancellationToken::new(), None).await
+    find_and_send_with_retry_source(bot, chat_id, track, Source::Auto, CancellationToken::new(), None, None).await
 }
 
 pub async fn find_and_send_with_retry_source(
@@ -542,15 +574,16 @@ pub async fn find_and_send_with_retry_source(
     source: Source,
     cancel: CancellationToken,
     thread_id: Option<ThreadId>,
+    user_id: Option<u64>,
 ) -> Result<()> {
-    match find_and_send_track_with_source(bot, chat_id, track, source, cancel.clone(), thread_id).await {
+    match find_and_send_track_with_source(bot, chat_id, track, source, cancel.clone(), thread_id, user_id).await {
         Ok(()) => Ok(()),
         Err(first_err) => {
             if cancel.is_cancelled() {
                 bail!("Отменено");
             }
             log::warn!("Попытка 1 не удалась для {}: {first_err:#}", track.search_query());
-            find_and_send_track_with_source(bot, chat_id, track, source, cancel, thread_id)
+            find_and_send_track_with_source(bot, chat_id, track, source, cancel, thread_id, user_id)
                 .await
                 .map_err(|e| {
                     anyhow::anyhow!(
@@ -705,8 +738,10 @@ pub async fn send_cached(
     chat_id: ChatId,
     cached: &cache::CachedTrack,
     thread_id: Option<ThreadId>,
+    user_id: Option<u64>,
+    query: &str,
 ) -> Result<()> {
-    send_cached_audio(bot, chat_id, cached, thread_id).await
+    send_cached_audio(bot, chat_id, cached, thread_id, user_id, query).await
 }
 
 pub fn sanitize_filename(name: &str) -> String {

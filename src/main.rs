@@ -2,6 +2,7 @@ mod cache;
 mod commands;
 mod downloader;
 mod handlers;
+mod lyrics;
 mod models;
 mod vk;
 mod yandex;
@@ -9,6 +10,7 @@ mod ym;
 
 use teloxide::prelude::*;
 use teloxide::dispatching::UpdateFilterExt;
+use teloxide::utils::command::BotCommands;
 use teloxide::types::Update;
 
 fn setup_logger() {
@@ -83,6 +85,14 @@ async fn main() {
     let bot_username = me.username.clone().unwrap_or_default();
     handlers::set_bot_username(bot_username);
     log::info!("Бот: @{}", me.username.as_deref().unwrap_or("?"));
+
+    // Регистрируем команды в меню Telegram
+    if let Err(e) = bot
+        .set_my_commands(commands::Command::bot_commands())
+        .await
+    {
+        log::warn!("Не удалось зарегистрировать команды: {e}");
+    }
 
     let handler = dptree::entry()
         .branch(

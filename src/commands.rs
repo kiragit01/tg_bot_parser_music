@@ -27,4 +27,10 @@ pub enum Command {
 
     #[command(description = "Статус текущей задачи")]
     Status,
+
+    #[command(description = "Настройки (тексты песен и др.)")]
+    Settings,
+
+    #[command(description = "Текст песни: /lyrics Исполнитель - Название")]
+    Lyrics(String),
 }
