@@ -6,6 +6,7 @@ use teloxide::prelude::*;
 use teloxide::types::{
     InlineKeyboardButton, InlineKeyboardMarkup,
     InlineQueryResult, InlineQueryResultArticle, InputMessageContent, InputMessageContentText,
+    ThreadId,
 };
 use teloxide::utils::command::BotCommands;
 use tokio::sync::{Mutex, Semaphore};
@@ -40,6 +41,10 @@ static SEARCH_CACHE: LazyLock<Mutex<HashMap<ChatId, Vec<SearchResult>>>> =
 
 /// Токены отмены per-chat.
 static CANCEL_TOKENS: LazyLock<Mutex<HashMap<ChatId, CancellationToken>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Кеш топиков: chat_id → thread_id созданного топика (для повторного использования диапазонами).
+static TOPIC_CACHE: LazyLock<Mutex<HashMap<ChatId, ThreadId>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Глобальный лимит одновременных скачиваний.
@@ -286,7 +291,8 @@ async fn handle_parse_playlist(bot: &Bot, msg: &Message, text: &str) -> HandlerR
 
             save_playlist(msg.chat.id, playlist).await;
 
-            let keyboard = source_keyboard("all");
+            let forum = is_forum_chat(&msg.chat);
+            let keyboard = source_keyboard("all", forum, false);
             bot.send_message(
                 msg.chat.id,
                 format!(
@@ -317,7 +323,9 @@ async fn handle_download_all(bot: &Bot, msg: &Message) -> HandlerResult {
     };
 
     let count = playlist.len();
-    let keyboard = source_keyboard("all");
+    let forum = is_forum_chat(&msg.chat);
+    let has_topic = has_saved_topic(msg.chat.id).await;
+    let keyboard = source_keyboard("all", forum, has_topic);
     bot.send_message(
         msg.chat.id,
         format!("📥 Скачать все {count} треков — выбери источник:"),
@@ -364,7 +372,7 @@ async fn download_tracks_parallel(
     chat_id: ChatId,
     tracks: &[Track],
 ) -> HandlerResult {
-    download_tracks_parallel_source(bot, chat_id, tracks, Source::Auto).await
+    download_tracks_parallel_source(bot, chat_id, tracks, Source::Auto, None).await
 }
 
 async fn download_tracks_parallel_source(
@@ -372,6 +380,7 @@ async fn download_tracks_parallel_source(
     chat_id: ChatId,
     tracks: &[Track],
     source: Source,
+    thread_id: Option<ThreadId>,
 ) -> HandlerResult {
     let total = tracks.len();
     let done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -388,6 +397,7 @@ async fn download_tracks_parallel_source(
         let track = track.clone();
         let cancel = cancel_token.clone();
         let cancelled = cancelled.clone();
+        let tid = thread_id;
 
         let handle = tokio::spawn(async move {
             // Проверяем отмену перед захватом семафора
@@ -409,7 +419,7 @@ async fn download_tracks_parallel_source(
                 return;
             }
 
-            match downloader::find_and_send_with_retry_source(&bot, chat_id, &track, source, cancel.clone()).await {
+            match downloader::find_and_send_with_retry_source(&bot, chat_id, &track, source, cancel.clone(), tid).await {
                 Ok(()) => {
                     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                 }
@@ -432,9 +442,12 @@ async fn download_tracks_parallel_source(
 
             let completed = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             if completed % PROGRESS_EVERY == 0 || completed == total {
-                let _ = bot
-                    .send_message(chat_id, format!("📊 Прогресс: {completed}/{total}"))
-                    .await;
+                let mut progress_req = bot
+                    .send_message(chat_id, format!("📊 Прогресс: {completed}/{total}"));
+                if let Some(t) = tid {
+                    progress_req = progress_req.message_thread_id(t);
+                }
+                let _ = progress_req.await;
             }
         });
 
@@ -452,6 +465,17 @@ async fn download_tracks_parallel_source(
     let completed = done.load(std::sync::atomic::Ordering::Relaxed);
     let ok_count = completed.saturating_sub(failed_list.len());
 
+    // Хелпер для отправки сообщения в нужный поток
+    macro_rules! send_to_thread {
+        ($text:expr) => {{
+            let mut r = bot.send_message(chat_id, $text);
+            if let Some(t) = thread_id {
+                r = r.message_thread_id(t);
+            }
+            r
+        }};
+    }
+
     if was_cancelled {
         let summary = format!("⏹ Остановлено. Скачано: {ok_count}/{total}");
         if !failed_list.is_empty() {
@@ -466,15 +490,14 @@ async fn download_tracks_parallel_source(
                 "{summary}\n\n❌ Не найдены ({fail_count}):\n\
                  <blockquote expandable>{items}</blockquote>"
             );
-            bot.send_message(chat_id, msg)
+            send_to_thread!(msg)
                 .parse_mode(teloxide::types::ParseMode::Html)
                 .await?;
         } else {
-            bot.send_message(chat_id, summary).await?;
+            send_to_thread!(summary).await?;
         }
     } else if failed_list.is_empty() {
-        bot.send_message(chat_id, format!("🎉 Готово! Все {total} треков скачаны."))
-            .await?;
+        send_to_thread!(format!("🎉 Готово! Все {total} треков скачаны.")).await?;
     } else {
         let fail_count = failed_list.len();
         let items: String = failed_list
@@ -489,7 +512,7 @@ async fn download_tracks_parallel_source(
              ❌ Не найдены ({fail_count}):\n\
              <blockquote expandable>{items}</blockquote>"
         );
-        bot.send_message(chat_id, summary)
+        send_to_thread!(summary)
             .parse_mode(teloxide::types::ParseMode::Html)
             .await?;
     }
@@ -565,7 +588,9 @@ async fn handle_download_range(bot: &Bot, msg: &Message, range: &str) -> Handler
     let count = indices.len();
     let range_clean = range.trim().to_string();
 
-    let keyboard = source_keyboard(&format!("range:{range_clean}"));
+    let forum = is_forum_chat(&msg.chat);
+    let has_topic = has_saved_topic(msg.chat.id).await;
+    let keyboard = source_keyboard(&format!("range:{range_clean}"), forum, has_topic);
     bot.send_message(
         msg.chat.id,
         format!("📥 Скачать {count} треков — выбери источник:"),
@@ -766,7 +791,9 @@ pub async fn process_inline(bot: Bot, q: InlineQuery) -> HandlerResult {
 }
 
 /// Клавиатура выбора источника. `prefix` — "all" или "range:1-20".
-fn source_keyboard(prefix: &str) -> InlineKeyboardMarkup {
+/// `is_forum` — показывать кнопку создания топика.
+/// `has_topic` — показывать кнопку "в топик плейлиста" (для диапазонов).
+fn source_keyboard(prefix: &str, is_forum: bool, has_topic: bool) -> InlineKeyboardMarkup {
     let has_ym = downloader::ym_available();
     let has_vk = downloader::vk_available();
 
@@ -777,9 +804,23 @@ fn source_keyboard(prefix: &str) -> InlineKeyboardMarkup {
         (false, false) => "🔀 Авто (SC→YT)",
     };
 
-    let mut rows: Vec<Vec<InlineKeyboardButton>> = vec![
-        vec![InlineKeyboardButton::callback(auto_label, format!("dl:{prefix}:auto"))],
-    ];
+    let mut rows: Vec<Vec<InlineKeyboardButton>> = Vec::new();
+
+    // Кнопки топика — только для форум-групп
+    if is_forum {
+        rows.push(vec![InlineKeyboardButton::callback(
+            "📌 В новый топик (авто)",
+            format!("dl:{prefix}:auto:t"),
+        )]);
+        if has_topic {
+            rows.push(vec![InlineKeyboardButton::callback(
+                "📌 В топик плейлиста (авто)",
+                format!("dl:{prefix}:auto:e"),
+            )]);
+        }
+    }
+
+    rows.push(vec![InlineKeyboardButton::callback(auto_label, format!("dl:{prefix}:auto"))]);
 
     // ЯМ — только если токен есть
     if has_ym {
@@ -801,6 +842,33 @@ fn source_keyboard(prefix: &str) -> InlineKeyboardMarkup {
     }
 
     InlineKeyboardMarkup::new(rows)
+}
+
+/// Проверяет, является ли чат форумом (супергруппа с топиками).
+fn is_forum_chat(chat: &teloxide::types::Chat) -> bool {
+    use teloxide::types::{ChatKind, PublicChatKind};
+    match &chat.kind {
+        ChatKind::Public(public) => match &public.kind {
+            PublicChatKind::Supergroup(sg) => sg.is_forum,
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Проверяет, есть ли сохранённый топик для чата.
+async fn has_saved_topic(chat_id: ChatId) -> bool {
+    TOPIC_CACHE.lock().await.contains_key(&chat_id)
+}
+
+/// Получает сохранённый thread_id для чата.
+async fn get_saved_topic(chat_id: ChatId) -> Option<ThreadId> {
+    TOPIC_CACHE.lock().await.get(&chat_id).copied()
+}
+
+/// Сохраняет thread_id топика для чата.
+async fn save_topic(chat_id: ChatId, thread_id: ThreadId) {
+    TOPIC_CACHE.lock().await.insert(chat_id, thread_id);
 }
 
 fn parse_source(s: &str) -> Source {
@@ -845,7 +913,7 @@ pub async fn process_callback(bot: Bot, q: CallbackQuery) -> HandlerResult {
 
         // === Кеш: проверяем file_id ===
         if let Some(cached) = cache::get(&cache_query).await {
-            match downloader::send_cached(&bot, chat_id, &cached).await {
+            match downloader::send_cached(&bot, chat_id, &cached, None).await {
                 Ok(()) => {
                     log::info!("[CACHE] Отправлен из кеша: {cache_query}");
                     bot.send_message(chat_id, "✅ Отправлен!").await?;
@@ -965,16 +1033,25 @@ pub async fn process_callback(bot: Bot, q: CallbackQuery) -> HandlerResult {
         return Ok(());
     }
 
-    // Обработка скачивания плейлиста: "dl:<scope>:<source>"
-    // scope может быть "all" или "range:25-40", поэтому source — последний сегмент после последнего ':'
+    // Обработка скачивания плейлиста: "dl:<scope>:<source>" или "dl:<scope>:<source>:t" (новый топик) / ":e" (существующий)
     if parts[0] != "dl" {
         return Ok(());
     }
 
+    // Парсим callback: dl:<scope>:<source>[:<topic_mode>]
+    // topic_mode: "t" = новый топик, "e" = существующий топик
+    let (topic_mode, data_without_topic) = if data.ends_with(":t") {
+        (Some("t"), &data[..data.len() - 2])
+    } else if data.ends_with(":e") {
+        (Some("e"), &data[..data.len() - 2])
+    } else {
+        (None, data.as_str())
+    };
+
     // Берём source из конца (после последнего :), scope — всё между первым и последним :
-    let Some(last_colon) = data.rfind(':') else { return Ok(()) };
-    let source = parse_source(&data[last_colon + 1..]);
-    let scope = &data[3..last_colon]; // пропускаем "dl:"
+    let Some(last_colon) = data_without_topic.rfind(':') else { return Ok(()) };
+    let source = parse_source(&data_without_topic[last_colon + 1..]);
+    let scope = &data_without_topic[3..last_colon]; // пропускаем "dl:"
 
     bot.answer_callback_query(q.id.clone()).await?;
 
@@ -1005,18 +1082,55 @@ pub async fn process_callback(bot: Bot, q: CallbackQuery) -> HandlerResult {
 
     let count = tracks.len();
     let src_label = source.label();
-    log::info!("[DL] chat={chat_id}, треков={count}, источник={src_label}");
 
-    bot.send_message(
+    // === Определяем thread_id ===
+    let thread_id: Option<ThreadId> = match topic_mode {
+        Some("t") => {
+            // Создаём новый форум-топик
+            let topic_name = playlist
+                .title
+                .as_deref()
+                .unwrap_or("🎵 Музыка");
+            let topic_name = format!("🎵 {topic_name}");
+            match bot.create_forum_topic(chat_id, &topic_name).await {
+                Ok(topic) => {
+                    let tid = topic.thread_id;
+                    save_topic(chat_id, tid).await;
+                    log::info!("[TOPIC] Создан топик «{topic_name}» для chat={chat_id}");
+                    Some(tid)
+                }
+                Err(e) => {
+                    log::warn!("Не удалось создать топик: {e}");
+                    bot.send_message(chat_id, format!(
+                        "⚠️ Не удалось создать топик: {e}\nСкачиваю в этот чат."
+                    )).await?;
+                    None
+                }
+            }
+        }
+        Some("e") => {
+            // Используем существующий топик
+            get_saved_topic(chat_id).await
+        }
+        _ => None,
+    };
+
+    log::info!("[DL] chat={chat_id}, треков={count}, источник={src_label}, топик={thread_id:?}");
+
+    // Отправляем статус в нужный поток
+    let mut start_msg = bot.send_message(
         chat_id,
         format!("📥 Скачиваю {count} треков ({src_label})...\nОстановить: /stop"),
-    )
-    .await?;
+    );
+    if let Some(tid) = thread_id {
+        start_msg = start_msg.message_thread_id(tid);
+    }
+    start_msg.await?;
 
     // Запускаем в фоне чтобы не блокировать обработку команд (в т.ч. /stop)
     let bot_clone = bot.clone();
     tokio::spawn(async move {
-        if let Err(e) = download_tracks_parallel_source(&bot_clone, chat_id, &tracks, source).await {
+        if let Err(e) = download_tracks_parallel_source(&bot_clone, chat_id, &tracks, source, thread_id).await {
             log::error!("Ошибка скачивания: {e:#}");
             let _ = bot_clone.send_message(chat_id, format!("❌ Ошибка: {e}")).await;
         }

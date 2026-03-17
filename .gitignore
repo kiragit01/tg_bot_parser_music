@@ -5,3 +5,5 @@
 /bot.log
 /Cargo.lock
 /cookies.txt
+/.claude/
+/.idea/
