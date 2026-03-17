@@ -52,6 +52,30 @@ static GLOBAL_SEMAPHORE: LazyLock<Semaphore> = LazyLock::new(|| {
     Semaphore::new(global_max_concurrent())
 });
 
+/// Ожидание ввода от пользователя (после пустой команды).
+#[derive(Debug, Clone)]
+enum PendingCommand {
+    Get,
+    Lyrics,
+    Download,
+}
+
+/// Ожидание ввода per-user per-chat.
+static PENDING_INPUT: LazyLock<Mutex<HashMap<(ChatId, UserId), PendingCommand>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+async fn set_pending(chat_id: ChatId, user_id: UserId, cmd: PendingCommand) {
+    PENDING_INPUT.lock().await.insert((chat_id, user_id), cmd);
+}
+
+async fn take_pending(chat_id: ChatId, user_id: UserId) -> Option<PendingCommand> {
+    PENDING_INPUT.lock().await.remove(&(chat_id, user_id))
+}
+
+async fn clear_pending(chat_id: ChatId, user_id: UserId) {
+    PENDING_INPUT.lock().await.remove(&(chat_id, user_id));
+}
+
 /// Макс. плейлистов в кеше (per-user).
 const MAX_CACHED_PLAYLISTS: usize = 500;
 
@@ -114,6 +138,40 @@ fn msg_user_id(msg: &Message) -> UserId {
     msg.from.as_ref().map(|u| u.id).unwrap_or(UserId(0))
 }
 
+/// Извлекает thread_id из сообщения (для ответа в ту же тему форума).
+fn msg_thread_id(msg: &Message) -> Option<ThreadId> {
+    msg.thread_id
+}
+
+/// Отправляет сообщение в тот же тред, откуда пришёл запрос.
+async fn reply_text(bot: &Bot, msg: &Message, text: &str) -> ResponseResult<Message> {
+    let mut req = bot.send_message(msg.chat.id, text);
+    if let Some(tid) = msg_thread_id(msg) {
+        req = req.message_thread_id(tid);
+    }
+    req.await
+}
+
+/// Отправляет сообщение с HTML в тот же тред.
+async fn reply_html(bot: &Bot, msg: &Message, text: &str) -> ResponseResult<Message> {
+    let mut req = bot.send_message(msg.chat.id, text)
+        .parse_mode(teloxide::types::ParseMode::Html);
+    if let Some(tid) = msg_thread_id(msg) {
+        req = req.message_thread_id(tid);
+    }
+    req.await
+}
+
+/// Отправляет сообщение с клавиатурой в тот же тред.
+async fn reply_markup(bot: &Bot, msg: &Message, text: &str, keyboard: InlineKeyboardMarkup) -> ResponseResult<Message> {
+    let mut req = bot.send_message(msg.chat.id, text)
+        .reply_markup(keyboard);
+    if let Some(tid) = msg_thread_id(msg) {
+        req = req.message_thread_id(tid);
+    }
+    req.await
+}
+
 const PROGRESS_EVERY: usize = 10;
 
 /// Общий лимит параллельных скачиваний на всех пользователей.
@@ -158,22 +216,49 @@ fn user_tag(msg: &Message) -> String {
 /// Единая точка входа для всех сообщений.
 pub async fn process_message(bot: Bot, msg: Message) -> HandlerResult {
     let Some(text) = msg.text() else {
+        // Не текст (файл, стикер и т.д.) — сбрасываем ожидание
+        clear_pending(msg.chat.id, msg_user_id(&msg)).await;
         return Ok(());
     };
 
-    // Пробуем распарсить как команду
+    let user_id = msg_user_id(&msg);
+
+    // Команда или ссылка — сбрасывает ожидание
     if let Ok(cmd) = Command::parse(text, bot_username()) {
+        clear_pending(msg.chat.id, user_id).await;
         log::info!("[CMD] {} -> {:?}", user_tag(&msg), cmd);
         return handle_command(&bot, &msg, cmd).await;
     }
 
     let is_group = msg.chat.is_group() || msg.chat.is_supergroup();
 
-    // Ссылка на ЯМ или iframe-код
+    // Ссылка на ЯМ или iframe-код — сбрасывает ожидание
     if yandex::is_yandex_music_url(text) {
+        clear_pending(msg.chat.id, user_id).await;
         log::info!("[PARSE] {} отправил ссылку ЯМ", user_tag(&msg));
         handle_parse_playlist(&bot, &msg, text).await?;
         return Ok(());
+    }
+
+    // Проверяем ожидание ввода (после пустой /get, /lyrics, /download)
+    if let Some(pending) = take_pending(msg.chat.id, user_id).await {
+        let input = text.trim();
+        if !input.is_empty() {
+            match pending {
+                PendingCommand::Get => {
+                    log::info!("[GET-PENDING] {} -> {}", user_tag(&msg), input);
+                    return handle_get_track(&bot, &msg, input).await;
+                }
+                PendingCommand::Lyrics => {
+                    log::info!("[LYRICS-PENDING] {} -> {}", user_tag(&msg), input);
+                    return handle_lyrics(&bot, &msg, input).await;
+                }
+                PendingCommand::Download => {
+                    log::info!("[DL-PENDING] {} -> {}", user_tag(&msg), input);
+                    return handle_download_range(&bot, &msg, input).await;
+                }
+            }
+        }
     }
 
     // В группах не реагируем на обычный текст (только команды и ссылки)
@@ -199,13 +284,12 @@ pub async fn process_message(bot: Bot, msg: Message) -> HandlerResult {
         return Ok(());
     }
 
-    bot.send_message(
-        msg.chat.id,
-        "🤔 Не понял. Отправь:\n\
-         • Ссылку на плейлист ЯМ\n\
-         • Iframe-код (кнопка «Код для вставки»)\n\
+    reply_text(&bot, &msg,
+        "🤔 Не понял. Попробуй:\n\
+         • /get Исполнитель - Название — скачать трек\n\
+         • Ссылку на плейлист Яндекс.Музыки\n\
          • Текстовый список треков (Исполнитель - Название)\n\
-         • /help для справки",
+         • /help — все команды",
     )
     .await?;
 
@@ -215,21 +299,22 @@ pub async fn process_message(bot: Bot, msg: Message) -> HandlerResult {
 async fn handle_command(bot: &Bot, msg: &Message, cmd: Command) -> HandlerResult {
     match cmd {
         Command::Start => {
-            bot.send_message(
-                msg.chat.id,
-                "👋 Привет! Я помогу перенести треки из Яндекс.Музыки.\n\n\
-                 📌 Как использовать:\n\
-                 1. Отправь ссылку на плейлист ЯМ\n\
-                 2. Или iframe-код (кнопка «Код для вставки»)\n\
-                 3. Или текстовый список треков (Исполнитель - Название)\n\n\
-                 🔍 Один трек: /get Исполнитель - Название\n\n\
-                 Треки скачиваются из YouTube через yt-dlp.",
+            reply_html(bot, msg,
+                "👋 Привет! Я скачиваю музыку прямо в Telegram.\n\n\
+                 🎵 <b>Что умею:</b>\n\
+                 • Скачать любой трек — /get Исполнитель - Название\n\
+                 • Перенести плейлист из Яндекс.Музыки — кинь ссылку\n\
+                 • Скачать по текстовому списку (Исполнитель - Название)\n\
+                 • Показать текст песни — /lyrics\n\n\
+                 🔍 <b>Где ищу:</b> SoundCloud, VK, YouTube, Яндекс.Музыка\n\
+                 ⚡ <b>Фишки:</b> параллельная загрузка, кэш (повторно — мгновенно), без цензуры\n\n\
+                 /help — все команды",
             )
             .await?;
         }
 
         Command::Help => {
-            bot.send_message(msg.chat.id, Command::descriptions().to_string())
+            reply_text(bot, msg, &Command::descriptions().to_string())
                 .await?;
         }
 
@@ -251,12 +336,10 @@ async fn handle_command(bot: &Bot, msg: &Message, cmd: Command) -> HandlerResult
 
         Command::Stop => {
             if cancel_download(msg.chat.id).await {
-                log::info!("[STOP] {} остановил скачивание", user_tag(&msg));
-                bot.send_message(msg.chat.id, "⏹ Скачивание остановлено.")
-                    .await?;
+                log::info!("[STOP] {} остановил скачивание", user_tag(msg));
+                reply_text(bot, msg, "⏹ Скачивание остановлено.").await?;
             } else {
-                bot.send_message(msg.chat.id, "ℹ️ Нет активного скачивания.")
-                    .await?;
+                reply_text(bot, msg, "ℹ️ Нет активного скачивания.").await?;
             }
         }
 
@@ -267,7 +350,7 @@ async fn handle_command(bot: &Bot, msg: &Message, cmd: Command) -> HandlerResult
             } else {
                 "📊 Нет активных задач."
             };
-            bot.send_message(msg.chat.id, status_msg).await?;
+            reply_text(bot, msg, status_msg).await?;
         }
 
         Command::Settings => {
@@ -283,44 +366,56 @@ async fn handle_command(bot: &Bot, msg: &Message, cmd: Command) -> HandlerResult
 }
 
 async fn handle_parse_playlist(bot: &Bot, msg: &Message, text: &str) -> HandlerResult {
-    bot.send_message(msg.chat.id, "⏳ Парсю плейлист...").await?;
+    reply_text(bot, msg, "⏳ Парсю плейлист...").await?;
 
     match yandex::parse_playlist(text).await {
         Ok(playlist) => {
             if playlist.is_empty() {
-                bot.send_message(msg.chat.id, "😕 Плейлист пуст или не удалось извлечь треки.")
-                    .await?;
+                reply_text(bot, msg, "😕 Плейлист пуст или не удалось извлечь треки.").await?;
                 return Ok(());
             }
 
             let count = playlist.len();
-            bot.send_message(msg.chat.id, format!("✅ Найдено треков: {count}"))
-                .await?;
+            reply_text(bot, msg, &format!("✅ Найдено треков: {count}")).await?;
 
             let pages = playlist.format_pages(50);
             for page in &pages {
-                bot.send_message(msg.chat.id, page)
-                    .parse_mode(teloxide::types::ParseMode::Html)
-                    .await?;
+                reply_html(bot, msg, page).await?;
             }
 
-            save_playlist(msg.chat.id, msg_user_id(msg), playlist).await;
+            save_playlist(msg.chat.id, msg_user_id(msg), playlist.clone()).await;
 
             let forum = is_forum_chat(&msg.chat);
-            let keyboard = source_keyboard("all", forum, false);
-            bot.send_message(
-                msg.chat.id,
-                format!(
-                    "📥 Скачать все {count} треков — выбери источник:\n\
-                     Или один трек: /get Исполнитель - Название"
-                ),
-            )
-            .reply_markup(keyboard)
-            .await?;
+            if let Some(keyboard) = source_keyboard("all", forum, false) {
+                reply_markup(bot, msg,
+                    &format!(
+                        "📥 Скачать все {count} треков — выбери источник:\n\
+                         Или один трек: /get Исполнитель - Название"
+                    ),
+                    keyboard,
+                ).await?;
+            } else {
+                // Нет YM — скачиваем автоматом
+                reply_text(bot, msg, &format!("📥 Скачиваю {count} треков...\nОстановить: /stop")).await?;
+                let bot_clone = bot.clone();
+                let chat_id = msg.chat.id;
+                let thread_id = msg_thread_id(msg);
+                let tracks = playlist.tracks;
+                tokio::spawn(async move {
+                    if let Err(e) = download_tracks_parallel_source(&bot_clone, chat_id, &tracks, Source::Auto, thread_id, None).await {
+                        log::error!("Ошибка скачивания: {e:#}");
+                        let mut err_msg = bot_clone.send_message(chat_id, format!("❌ Ошибка: {e}"));
+                        if let Some(tid) = thread_id {
+                            err_msg = err_msg.message_thread_id(tid);
+                        }
+                        let _ = err_msg.await;
+                    }
+                });
+            }
         }
         Err(e) => {
             log::error!("Ошибка парсинга: {e:#}");
-            bot.send_message(msg.chat.id, format!("❌ {e}")).await?;
+            reply_text(bot, msg, &format!("❌ {e}")).await?;
         }
     }
 
@@ -329,24 +424,37 @@ async fn handle_parse_playlist(bot: &Bot, msg: &Message, text: &str) -> HandlerR
 
 async fn handle_download_all(bot: &Bot, msg: &Message) -> HandlerResult {
     let Some(playlist) = get_playlist(msg.chat.id, msg_user_id(msg)).await else {
-        bot.send_message(
-            msg.chat.id,
-            "❌ Нет сохранённого плейлиста. Сначала отправь ссылку или iframe-код.",
-        )
-        .await?;
+        reply_text(bot, msg, "❌ Нет сохранённого плейлиста. Сначала отправь ссылку или iframe-код.").await?;
         return Ok(());
     };
 
     let count = playlist.len();
     let forum = is_forum_chat(&msg.chat);
     let has_topic = has_saved_topic(msg.chat.id).await;
-    let keyboard = source_keyboard("all", forum, has_topic);
-    bot.send_message(
-        msg.chat.id,
-        format!("📥 Скачать все {count} треков — выбери источник:"),
-    )
-    .reply_markup(keyboard)
-    .await?;
+
+    if let Some(keyboard) = source_keyboard("all", forum, has_topic) {
+        reply_markup(bot, msg,
+            &format!("📥 Скачать все {count} треков — выбери источник:"),
+            keyboard,
+        ).await?;
+    } else {
+        // Нет YM — скачиваем автоматом
+        reply_text(bot, msg, &format!("📥 Скачиваю {count} треков...\nОстановить: /stop")).await?;
+        let bot_clone = bot.clone();
+        let chat_id = msg.chat.id;
+        let thread_id = msg_thread_id(msg);
+        let tracks = playlist.tracks.clone();
+        tokio::spawn(async move {
+            if let Err(e) = download_tracks_parallel_source(&bot_clone, chat_id, &tracks, Source::Auto, thread_id, None).await {
+                log::error!("Ошибка скачивания: {e:#}");
+                let mut err_msg = bot_clone.send_message(chat_id, format!("❌ Ошибка: {e}"));
+                if let Some(tid) = thread_id {
+                    err_msg = err_msg.message_thread_id(tid);
+                }
+                let _ = err_msg.await;
+            }
+        });
+    }
 
     Ok(())
 }
@@ -358,24 +466,24 @@ async fn handle_text_tracklist(bot: &Bot, msg: &Message, lines: &[&str]) -> Hand
         .collect();
 
     if tracks.is_empty() {
-        bot.send_message(msg.chat.id, "😕 Не удалось распознать треки.")
-            .await?;
+        reply_text(bot, msg, "😕 Не удалось распознать треки.").await?;
         return Ok(());
     }
 
     let count = tracks.len();
-    bot.send_message(
-        msg.chat.id,
-        format!("✅ {count} треков. Скачиваю...\nОстановить: /stop"),
-    )
-    .await?;
+    reply_text(bot, msg, &format!("✅ {count} треков. Скачиваю...\nОстановить: /stop")).await?;
 
     let bot_clone = bot.clone();
     let chat_id = msg.chat.id;
+    let thread_id = msg_thread_id(msg);
     tokio::spawn(async move {
-        if let Err(e) = download_tracks_parallel(&bot_clone, chat_id, &tracks).await {
+        if let Err(e) = download_tracks_parallel_source(&bot_clone, chat_id, &tracks, Source::Auto, thread_id, None).await {
             log::error!("Ошибка скачивания: {e:#}");
-            let _ = bot_clone.send_message(chat_id, format!("❌ Ошибка: {e}")).await;
+            let mut err_msg = bot_clone.send_message(chat_id, format!("❌ Ошибка: {e}"));
+            if let Some(tid) = thread_id {
+                err_msg = err_msg.message_thread_id(tid);
+            }
+            let _ = err_msg.await;
         }
     });
 
@@ -562,42 +670,34 @@ fn parse_track_indices(input: &str, total: usize) -> Vec<usize> {
 
 async fn handle_download_range(bot: &Bot, msg: &Message, range: &str) -> HandlerResult {
     if range.trim().is_empty() {
-        let hint = match get_playlist(msg.chat.id, msg_user_id(msg)).await {
-            Some(pl) => format!(
-                "📥 Укажи номера треков:\n\
-                 /download 1-20 — треки 1-20\n\
-                 /download 30-60 — треки 30-60\n\
-                 /download 1,5,10 — конкретные\n\
-                 /download 30-60,70-99 — несколько диапазонов\n\n\
-                 Доступно: 1-{}", pl.len()
-            ),
-            None => "❌ Сначала отправь ссылку на плейлист ЯМ, потом /download <номера>".to_string(),
+        match get_playlist(msg.chat.id, msg_user_id(msg)).await {
+            Some(pl) => {
+                set_pending(msg.chat.id, msg_user_id(msg), PendingCommand::Download).await;
+                reply_text(bot, msg, &format!(
+                    "📥 Напиши номера треков (доступно: 1-{}):\n\
+                     Например: 1-20, 30-60, 1,5,10", pl.len()
+                )).await?;
+            }
+            None => {
+                reply_text(bot, msg, "❌ Сначала отправь ссылку на плейлист, потом /download").await?;
+            }
         };
-        bot.send_message(msg.chat.id, hint).await?;
         return Ok(());
     }
 
     let Some(playlist) = get_playlist(msg.chat.id, msg_user_id(msg)).await else {
-        bot.send_message(
-            msg.chat.id,
-            "❌ Нет сохранённого плейлиста. Сначала отправь ссылку или iframe-код.",
-        )
-        .await?;
+        reply_text(bot, msg, "❌ Нет сохранённого плейлиста. Сначала отправь ссылку или iframe-код.").await?;
         return Ok(());
     };
 
     let indices = parse_track_indices(range, playlist.len());
 
     if indices.is_empty() {
-        bot.send_message(
-            msg.chat.id,
-            format!(
-                "❌ Неверный диапазон. Доступно: 1-{}\n\
-                 Примеры: /download 30-60 или /download 1,5,10 или /download 30-60,70-99",
-                playlist.len()
-            ),
-        )
-        .await?;
+        reply_text(bot, msg, &format!(
+            "❌ Неверный диапазон. Доступно: 1-{}\n\
+             Примеры: /download 30-60 или /download 1,5,10 или /download 30-60,70-99",
+            playlist.len()
+        )).await?;
         return Ok(());
     }
 
@@ -606,13 +706,30 @@ async fn handle_download_range(bot: &Bot, msg: &Message, range: &str) -> Handler
 
     let forum = is_forum_chat(&msg.chat);
     let has_topic = has_saved_topic(msg.chat.id).await;
-    let keyboard = source_keyboard(&format!("range:{range_clean}"), forum, has_topic);
-    bot.send_message(
-        msg.chat.id,
-        format!("📥 Скачать {count} треков — выбери источник:"),
-    )
-    .reply_markup(keyboard)
-    .await?;
+
+    if let Some(keyboard) = source_keyboard(&format!("range:{range_clean}"), forum, has_topic) {
+        reply_markup(bot, msg,
+            &format!("📥 Скачать {count} треков — выбери источник:"),
+            keyboard,
+        ).await?;
+    } else {
+        // Нет YM — скачиваем автоматом
+        let tracks: Vec<Track> = indices.iter().map(|&i| playlist.tracks[i].clone()).collect();
+        reply_text(bot, msg, &format!("📥 Скачиваю {count} треков...\nОстановить: /stop")).await?;
+        let bot_clone = bot.clone();
+        let chat_id = msg.chat.id;
+        let thread_id = msg_thread_id(msg);
+        tokio::spawn(async move {
+            if let Err(e) = download_tracks_parallel_source(&bot_clone, chat_id, &tracks, Source::Auto, thread_id, None).await {
+                log::error!("Ошибка скачивания: {e:#}");
+                let mut err_msg = bot_clone.send_message(chat_id, format!("❌ Ошибка: {e}"));
+                if let Some(tid) = thread_id {
+                    err_msg = err_msg.message_thread_id(tid);
+                }
+                let _ = err_msg.await;
+            }
+        });
+    }
 
     Ok(())
 }
@@ -620,8 +737,8 @@ async fn handle_download_range(bot: &Bot, msg: &Message, range: &str) -> Handler
 async fn handle_get_track(bot: &Bot, msg: &Message, query: &str) -> HandlerResult {
     let query = query.trim();
     if query.is_empty() {
-        bot.send_message(msg.chat.id, "🔍 Укажи трек: /get Исполнитель - Название")
-            .await?;
+        set_pending(msg.chat.id, msg_user_id(msg), PendingCommand::Get).await;
+        reply_text(bot, msg, "🔍 Напиши название трека или Исполнитель - Название:").await?;
         return Ok(());
     }
 
@@ -635,8 +752,7 @@ async fn handle_get_track(bot: &Bot, msg: &Message, query: &str) -> HandlerResul
 
     // === Кеш поиска: проверяем ===
     if let Some(cached) = cache::get_search(&search_q, "all").await {
-        bot.send_message(msg.chat.id, format!("🔍 Ищу на всех платформах: {search_q}"))
-            .await?;
+        reply_text(bot, msg, &format!("🔍 Ищу на всех платформах: {search_q}")).await?;
         let all_results: Vec<SearchResult> = cached
             .into_iter()
             .map(|c| SearchResult {
@@ -657,8 +773,7 @@ async fn handle_get_track(bot: &Bot, msg: &Message, query: &str) -> HandlerResul
         return show_search_results(bot, msg, &search_q, &track, all_results).await;
     }
 
-    bot.send_message(msg.chat.id, format!("🔍 Ищу на всех платформах: {search_q}"))
-        .await?;
+    reply_text(bot, msg, &format!("🔍 Ищу на всех платформах: {search_q}")).await?;
 
     // Параллельный поиск на всех доступных платформах
     let search_q_ref = &search_q;
@@ -708,13 +823,16 @@ async fn show_search_results(
     track: &Track,
     all_results: Vec<SearchResult>,
 ) -> HandlerResult {
+    let thread_id = msg_thread_id(msg);
+    let user_id = Some(msg_user_id(msg).0);
+
     if all_results.is_empty() {
-        match downloader::find_and_send_with_retry(bot, msg.chat.id, track).await {
+        match downloader::find_and_send_with_retry_source(bot, msg.chat.id, track, Source::Auto, tokio_util::sync::CancellationToken::new(), thread_id, user_id).await {
             Ok(()) => {
-                bot.send_message(msg.chat.id, "✅ Отправлен!").await?;
+                reply_text(bot, msg, "✅ Отправлен!").await?;
             }
             Err(e) => {
-                bot.send_message(msg.chat.id, format!("❌ {e}")).await?;
+                reply_text(bot, msg, &format!("❌ {e}")).await?;
             }
         }
         return Ok(());
@@ -742,10 +860,13 @@ async fn show_search_results(
     save_search_results(msg.chat.id, msg_user_id(msg), all_results).await;
 
     let keyboard = InlineKeyboardMarkup::new(buttons);
-    bot.send_message(msg.chat.id, text)
+    let mut req = bot.send_message(msg.chat.id, text)
         .parse_mode(teloxide::types::ParseMode::Html)
-        .reply_markup(keyboard)
-        .await?;
+        .reply_markup(keyboard);
+    if let Some(tid) = thread_id {
+        req = req.message_thread_id(tid);
+    }
+    req.await?;
 
     Ok(())
 }
@@ -798,10 +919,10 @@ async fn search_vk(query: &str) -> Vec<SearchResult> {
 
 
 fn auto_search_label() -> &'static str {
-    match (downloader::ym_available(), downloader::vk_available()) {
-        (true, true) => "🔀 Авто (YM→SC→VK→YT)",
-        (true, false) => "🔀 Авто (YM→SC→YT)",
-        (false, true) => "🔀 Авто (SC→VK→YT)",
+    match (downloader::vk_available(), downloader::ym_available()) {
+        (true, true) => "🔀 Авто (SC→VK→YT→YM)",
+        (true, false) => "🔀 Авто (SC→VK→YT)",
+        (false, true) => "🔀 Авто (SC→YT→YM)",
         (false, false) => "🔀 Авто (SC→YT)",
     }
 }
@@ -822,26 +943,69 @@ async fn handle_settings(bot: &Bot, msg: &Message) -> HandlerResult {
     let user_id = msg_user_id(msg).0;
     let settings = cache::get_user_settings(user_id).await;
     let keyboard = settings_keyboard(&settings);
-    bot.send_message(msg.chat.id, "⚙️ Настройки:")
-        .reply_markup(keyboard)
-        .await?;
+    reply_markup(bot, msg, "⚙️ Настройки:", keyboard).await?;
+    Ok(())
+}
+
+/// Отправляет текст песни в blockquote (из callback — chat_id + thread_id).
+async fn send_lyrics_to_chat(bot: &Bot, chat_id: ChatId, thread_id: Option<ThreadId>, title: &str, text: &str) -> HandlerResult {
+    use teloxide::types::ParseMode;
+    let escaped_title = html_escape(title);
+    let escaped_text = html_escape(text);
+    let full = format!("📝 <b>{escaped_title}</b>\n\n<blockquote expandable>{escaped_text}</blockquote>");
+
+    if full.len() <= 4096 {
+        let mut req = bot.send_message(chat_id, &full).parse_mode(ParseMode::Html);
+        if let Some(tid) = thread_id { req = req.message_thread_id(tid); }
+        req.await?;
+    } else {
+        let max_text_len = 3800;
+        let mut offset = 0;
+        let mut part = 1;
+        while offset < escaped_text.len() {
+            let boundary = (offset + max_text_len).min(escaped_text.len());
+            let safe_boundary = escaped_text.floor_char_boundary(boundary);
+            let end = if safe_boundary >= escaped_text.len() {
+                escaped_text.len()
+            } else {
+                escaped_text[offset..safe_boundary].rfind('\n').map(|pos| offset + pos).unwrap_or(safe_boundary)
+            };
+            let chunk = &escaped_text[offset..end];
+            let msg_text = if part == 1 {
+                format!("📝 <b>{escaped_title}</b>\n\n<blockquote expandable>{chunk}</blockquote>")
+            } else {
+                format!("<blockquote expandable>{chunk}</blockquote>")
+            };
+            let mut req = bot.send_message(chat_id, &msg_text).parse_mode(ParseMode::Html);
+            if let Some(tid) = thread_id { req = req.message_thread_id(tid); }
+            req.await?;
+            offset = end;
+            if offset < escaped_text.len() && escaped_text.as_bytes()[offset] == b'\n' { offset += 1; }
+            part += 1;
+        }
+    }
     Ok(())
 }
 
 /// Отправляет текст песни в blockquote формате. Разбивает на части если длинный.
-async fn send_lyrics_message(bot: &Bot, chat_id: ChatId, title: &str, text: &str) -> HandlerResult {
+async fn send_lyrics_message(bot: &Bot, msg: &Message, title: &str, text: &str) -> HandlerResult {
     use teloxide::types::ParseMode;
 
     let escaped_title = html_escape(title);
     let escaped_text = html_escape(text);
+    let thread_id = msg_thread_id(msg);
+    let chat_id = msg.chat.id;
 
     // Формируем: заголовок + свёрнутая цитата
     let full = format!("📝 <b>{escaped_title}</b>\n\n<blockquote expandable>{escaped_text}</blockquote>");
 
     if full.len() <= 4096 {
-        bot.send_message(chat_id, &full)
-            .parse_mode(ParseMode::Html)
-            .await?;
+        let mut req = bot.send_message(chat_id, &full)
+            .parse_mode(ParseMode::Html);
+        if let Some(tid) = thread_id {
+            req = req.message_thread_id(tid);
+        }
+        req.await?;
     } else {
         // Разбиваем текст на части (безопасно по границам символов)
         let max_text_len = 3800;
@@ -854,7 +1018,6 @@ async fn send_lyrics_message(bot: &Bot, chat_id: ChatId, title: &str, text: &str
             let end = if safe_boundary >= escaped_text.len() {
                 escaped_text.len()
             } else {
-                // Ищем перенос строки для красивого разрыва
                 escaped_text[offset..safe_boundary]
                     .rfind('\n')
                     .map(|pos| offset + pos)
@@ -868,13 +1031,16 @@ async fn send_lyrics_message(bot: &Bot, chat_id: ChatId, title: &str, text: &str
                 format!("<blockquote expandable>{chunk}</blockquote>")
             };
 
-            bot.send_message(chat_id, &msg_text)
-                .parse_mode(ParseMode::Html)
-                .await?;
+            let mut req = bot.send_message(chat_id, &msg_text)
+                .parse_mode(ParseMode::Html);
+            if let Some(tid) = thread_id {
+                req = req.message_thread_id(tid);
+            }
+            req.await?;
 
             offset = end;
             if offset < escaped_text.len() && escaped_text.as_bytes()[offset] == b'\n' {
-                offset += 1; // пропускаем символ переноса на стыке
+                offset += 1;
             }
             part += 1;
         }
@@ -885,19 +1051,18 @@ async fn send_lyrics_message(bot: &Bot, chat_id: ChatId, title: &str, text: &str
 async fn handle_lyrics(bot: &Bot, msg: &Message, query: &str) -> HandlerResult {
     let query = query.trim();
     if query.is_empty() {
-        bot.send_message(msg.chat.id, "🔍 Укажи трек: /lyrics Исполнитель - Название")
-            .await?;
+        set_pending(msg.chat.id, msg_user_id(msg), PendingCommand::Lyrics).await;
+        reply_text(bot, msg, "📝 Напиши название трека, для которого найти текст:").await?;
         return Ok(());
     }
 
-    bot.send_message(msg.chat.id, "⏳ Ищу текст...").await?;
+    reply_text(bot, msg, "⏳ Ищу текст...").await?;
     match crate::lyrics::fetch_lyrics(query).await {
         Some(text) => {
-            send_lyrics_message(bot, msg.chat.id, query, &text).await?;
+            send_lyrics_message(bot, msg, query, &text).await?;
         }
         None => {
-            bot.send_message(msg.chat.id, "😕 Текст не найден. Проверь написание или попробуй на английском.")
-                .await?;
+            reply_text(bot, msg, "😕 Текст не найден. Проверь написание или попробуй на английском.").await?;
         }
     }
     Ok(())
@@ -962,16 +1127,15 @@ pub async fn process_inline(bot: Bot, q: InlineQuery) -> HandlerResult {
 /// Клавиатура выбора источника. `prefix` — "all" или "range:1-20".
 /// `is_forum` — показывать кнопку создания топика.
 /// `has_topic` — показывать кнопку "в топик плейлиста" (для диапазонов).
-fn source_keyboard(prefix: &str, is_forum: bool, has_topic: bool) -> InlineKeyboardMarkup {
+/// Клавиатура выбора источника для скачивания плейлиста.
+/// Показывает только Auto + YM (если токен есть). SC/VK/YT убраны.
+/// Возвращает None если YM недоступен — тогда нужно скачивать автоматом.
+fn source_keyboard(prefix: &str, is_forum: bool, has_topic: bool) -> Option<InlineKeyboardMarkup> {
     let has_ym = downloader::ym_available();
-    let has_vk = downloader::vk_available();
 
-    let auto_label = match (has_ym, has_vk) {
-        (true, true) => "🔀 Авто (YM→SC→VK→YT)",
-        (true, false) => "🔀 Авто (YM→SC→YT)",
-        (false, true) => "🔀 Авто (SC→VK→YT)",
-        (false, false) => "🔀 Авто (SC→YT)",
-    };
+    if !has_ym {
+        return None; // Без YM — автоскачивание, клавиатуру не показываем
+    }
 
     let mut rows: Vec<Vec<InlineKeyboardButton>> = Vec::new();
 
@@ -989,28 +1153,10 @@ fn source_keyboard(prefix: &str, is_forum: bool, has_topic: bool) -> InlineKeybo
         }
     }
 
-    rows.push(vec![InlineKeyboardButton::callback(auto_label, format!("dl:{prefix}:auto"))]);
+    rows.push(vec![InlineKeyboardButton::callback("🔀 Авто", format!("dl:{prefix}:auto"))]);
+    rows.push(vec![InlineKeyboardButton::callback("🎵 Яндекс.Музыка", format!("dl:{prefix}:ym"))]);
 
-    // ЯМ — только если токен есть
-    if has_ym {
-        rows.push(vec![
-            InlineKeyboardButton::callback("🎵 Яндекс.Музыка", format!("dl:{prefix}:ym")),
-        ]);
-    }
-
-    let row2 = vec![
-        InlineKeyboardButton::callback("☁️ SoundCloud", format!("dl:{prefix}:sc")),
-        InlineKeyboardButton::callback("▶️ YouTube", format!("dl:{prefix}:yt")),
-    ];
-    rows.push(row2);
-
-    if has_vk {
-        rows.push(vec![
-            InlineKeyboardButton::callback("🎶 VK Music", format!("dl:{prefix}:vk")),
-        ]);
-    }
-
-    InlineKeyboardMarkup::new(rows)
+    Some(InlineKeyboardMarkup::new(rows))
 }
 
 /// Проверяет, является ли чат форумом (супергруппа с топиками).
@@ -1057,6 +1203,20 @@ pub async fn process_callback(bot: Bot, q: CallbackQuery) -> HandlerResult {
     let chat_id = msg.chat().id;
     let msg_id = msg.id();
 
+    // Извлекаем thread_id из сообщения callback (для ответа в ту же тему)
+    let cb_thread_id: Option<ThreadId> = msg.regular_message().and_then(|m| m.thread_id);
+
+    // Хелпер: отправить сообщение в тот же тред
+    macro_rules! cb_send {
+        ($text:expr) => {{
+            let mut r = bot.send_message(chat_id, $text);
+            if let Some(tid) = cb_thread_id {
+                r = r.message_thread_id(tid);
+            }
+            r.await
+        }};
+    }
+
     let parts: Vec<&str> = data.splitn(3, ':').collect();
     if parts.len() < 2 {
         return Ok(());
@@ -1072,8 +1232,7 @@ pub async fn process_callback(bot: Bot, q: CallbackQuery) -> HandlerResult {
         };
 
         let Some(result) = get_search_result(chat_id, q.from.id, index).await else {
-            bot.send_message(chat_id, "❌ Результат не найден. Попробуй поиск заново.")
-                .await?;
+            cb_send!("❌ Результат не найден. Попробуй поиск заново.")?;
             return Ok(());
         };
 
@@ -1082,10 +1241,10 @@ pub async fn process_callback(bot: Bot, q: CallbackQuery) -> HandlerResult {
 
         // === Кеш: проверяем file_id ===
         if let Some(cached) = cache::get(&cache_query).await {
-            match downloader::send_cached(&bot, chat_id, &cached, None, Some(q.from.id.0), &cache_query).await {
+            match downloader::send_cached(&bot, chat_id, &cached, cb_thread_id, Some(q.from.id.0), &cache_query).await {
                 Ok(()) => {
                     log::info!("[CACHE] Отправлен из кеша: {cache_query}");
-                    bot.send_message(chat_id, "✅ Отправлен!").await?;
+                    cb_send!("✅ Отправлен!")?;
                     return Ok(());
                 }
                 Err(e) => {
@@ -1094,11 +1253,7 @@ pub async fn process_callback(bot: Bot, q: CallbackQuery) -> HandlerResult {
             }
         }
 
-        bot.send_message(
-            chat_id,
-            format!("⏳ Скачиваю из {}...", platform_name),
-        )
-        .await?;
+        cb_send!(format!("⏳ Скачиваю из {}...", platform_name))?;
 
         let safe_name = downloader::sanitize_filename(&format!(
             "{} - {}",
@@ -1158,6 +1313,10 @@ pub async fn process_callback(bot: Bot, q: CallbackQuery) -> HandlerResult {
                         .title(&result.title)
                         .performer(&result.artist);
 
+                    if let Some(tid) = cb_thread_id {
+                        req = req.message_thread_id(tid);
+                    }
+
                     // Обложка — пробуем для всех платформ (YM → yt-dlp fallback)
                     let cover_query = format!("{} - {}", result.artist, result.title);
                     if let Some(thumb) = downloader::fetch_thumbnail_by_query(&cover_query).await {
@@ -1193,11 +1352,11 @@ pub async fn process_callback(bot: Bot, q: CallbackQuery) -> HandlerResult {
                     }
                 }
                 tokio::fs::remove_file(&output_path).await.ok();
-                bot.send_message(chat_id, "✅ Отправлен!").await?;
+                cb_send!("✅ Отправлен!")?;
             }
             Err(e) => {
                 tokio::fs::remove_file(&output_path).await.ok();
-                bot.send_message(chat_id, format!("❌ {e}")).await?;
+                cb_send!(format!("❌ {e}"))?;
             }
         }
         return Ok(());
@@ -1221,15 +1380,13 @@ pub async fn process_callback(bot: Bot, q: CallbackQuery) -> HandlerResult {
     // Обработка запроса текста: "lyrics:<query>"
     if let Some(lyrics_query) = data.strip_prefix("lyrics:") {
         bot.answer_callback_query(q.id.clone()).await?;
-        bot.send_message(chat_id, "⏳ Ищу текст...")
-            .await?;
+        cb_send!("⏳ Ищу текст...")?;
         match crate::lyrics::fetch_lyrics(lyrics_query).await {
             Some(text) => {
-                send_lyrics_message(&bot, chat_id, lyrics_query, &text).await?;
+                send_lyrics_to_chat(&bot, chat_id, cb_thread_id, lyrics_query, &text).await?;
             }
             None => {
-                bot.send_message(chat_id, "😕 Текст не найден.")
-                    .await?;
+                cb_send!("😕 Текст не найден.")?;
             }
         }
         return Ok(());
@@ -1246,13 +1403,13 @@ pub async fn process_callback(bot: Bot, q: CallbackQuery) -> HandlerResult {
         } else {
             Track::new("", value)
         };
-        bot.send_message(chat_id, "⏳ Авто-поиск...").await?;
-        match downloader::find_and_send_with_retry(&bot, chat_id, &track).await {
+        cb_send!("⏳ Авто-поиск...")?;
+        match downloader::find_and_send_with_retry_source(&bot, chat_id, &track, Source::Auto, CancellationToken::new(), cb_thread_id, Some(q.from.id.0)).await {
             Ok(()) => {
-                bot.send_message(chat_id, "✅ Отправлен!").await?;
+                cb_send!("✅ Отправлен!")?;
             }
             Err(e) => {
-                bot.send_message(chat_id, format!("❌ {e}")).await?;
+                cb_send!(format!("❌ {e}"))?;
             }
         }
         return Ok(());
@@ -1284,8 +1441,7 @@ pub async fn process_callback(bot: Bot, q: CallbackQuery) -> HandlerResult {
     let _ = bot.edit_message_reply_markup(chat_id, msg_id).await;
 
     let Some(playlist) = get_playlist(chat_id, q.from.id).await else {
-        bot.send_message(chat_id, "❌ Плейлист не найден. Отправь ссылку заново.")
-            .await?;
+        cb_send!("❌ Плейлист не найден. Отправь ссылку заново.")?;
         return Ok(());
     };
 
@@ -1300,8 +1456,7 @@ pub async fn process_callback(bot: Bot, q: CallbackQuery) -> HandlerResult {
     };
 
     if tracks.is_empty() {
-        bot.send_message(chat_id, "❌ Нет треков для скачивания.")
-            .await?;
+        cb_send!("❌ Нет треков для скачивания.")?;
         return Ok(());
     }
 
@@ -1326,9 +1481,7 @@ pub async fn process_callback(bot: Bot, q: CallbackQuery) -> HandlerResult {
                 }
                 Err(e) => {
                     log::warn!("Не удалось создать топик: {e}");
-                    bot.send_message(chat_id, format!(
-                        "⚠️ Не удалось создать топик: {e}\nСкачиваю в этот чат."
-                    )).await?;
+                    cb_send!(format!("⚠️ Не удалось создать топик: {e}\nСкачиваю в этот чат."))?;
                     None
                 }
             }
@@ -1337,7 +1490,7 @@ pub async fn process_callback(bot: Bot, q: CallbackQuery) -> HandlerResult {
             // Используем существующий топик
             get_saved_topic(chat_id).await
         }
-        _ => None,
+        _ => cb_thread_id, // Если не создаём/не используем топик — отвечаем в тот же тред
     };
 
     log::info!("[DL] chat={chat_id}, треков={count}, источник={src_label}, топик={thread_id:?}");
@@ -1357,7 +1510,11 @@ pub async fn process_callback(bot: Bot, q: CallbackQuery) -> HandlerResult {
     tokio::spawn(async move {
         if let Err(e) = download_tracks_parallel_source(&bot_clone, chat_id, &tracks, source, thread_id, Some(q.from.id.0)).await {
             log::error!("Ошибка скачивания: {e:#}");
-            let _ = bot_clone.send_message(chat_id, format!("❌ Ошибка: {e}")).await;
+            let mut err_msg = bot_clone.send_message(chat_id, format!("❌ Ошибка: {e}"));
+            if let Some(tid) = thread_id {
+                err_msg = err_msg.message_thread_id(tid);
+            }
+            let _ = err_msg.await;
         }
     });
 

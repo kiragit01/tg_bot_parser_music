@@ -2,35 +2,35 @@ use teloxide::utils::command::BotCommands;
 
 /// Команды бота.
 #[derive(BotCommands, Clone, Debug)]
-#[command(rename_rule = "lowercase", description = "Доступные команды:")]
+#[command(rename_rule = "lowercase", description = "Команды:")]
 pub enum Command {
-    #[command(description = "Начать работу с ботом")]
+    #[command(description = "Приветствие")]
     Start,
 
-    #[command(description = "Показать это сообщение")]
+    #[command(description = "Список команд")]
     Help,
 
-    #[command(description = "Парсить плейлист: /parse <ссылка на ЯМ>")]
+    #[command(description = "Плейлист ЯМ → список треков")]
     Parse(String),
 
-    #[command(description = "Найти и скачать трек: /get <исполнитель - название>")]
+    #[command(description = "Скачать трек: /get Артист - Трек")]
     Get(String),
 
-    #[command(description = "Скачать все треки из последнего плейлиста")]
+    #[command(description = "Скачать весь плейлист")]
     DownloadAll,
 
-    #[command(description = "Скачать треки: /download 30-60 или 1,5,10")]
+    #[command(description = "Скачать выборочно: /download 1-20")]
     Download(String),
 
-    #[command(description = "Остановить скачивание")]
+    #[command(description = "Остановить загрузку")]
     Stop,
 
-    #[command(description = "Статус текущей задачи")]
+    #[command(description = "Статус загрузки")]
     Status,
 
-    #[command(description = "Настройки (тексты песен и др.)")]
+    #[command(description = "Настройки")]
     Settings,
 
-    #[command(description = "Текст песни: /lyrics Исполнитель - Название")]
+    #[command(description = "Текст песни: /lyrics Артист - Трек")]
     Lyrics(String),
 }

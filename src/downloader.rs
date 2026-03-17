@@ -175,23 +175,16 @@ async fn download_via_ytdlp(track: &Track, output_path: &PathBuf, search_prefix:
     Ok(())
 }
 
-/// Автоматический выбор источника: YM → SC → VK → YT.
+/// Автоматический выбор источника: SC → VK → YT → YM.
+/// YM последний — у него бывает цензура (чистые версии треков).
 async fn download_auto(track: &Track, output_path: &PathBuf) -> Result<&'static str> {
-    // 1. Яндекс.Музыка (оригинальное качество, без цензуры)
-    if ym::is_available() {
-        match ym::search_and_download(track, output_path).await {
-            Ok(()) => return Ok("YM"),
-            Err(e) => log::debug!("YM не сработал для {}: {e:#}", track.search_query()),
-        }
-    }
-
-    // 2. SoundCloud (пробуем до 3 результатов, пропуская превью)
+    // 1. SoundCloud (быстро, хорошее качество)
     match download_sc_with_fallback(track, output_path).await {
         Ok(()) => return Ok("SC"),
         Err(e) => log::debug!("SC не сработал для {}: {e:#}", track.search_query()),
     }
 
-    // 3. VK (если токен есть)
+    // 2. VK (без цензуры, оригиналы)
     if let Some(token) = vk_token() {
         match download_from_vk(&token, track, output_path).await {
             Ok(()) => return Ok("VK"),
@@ -201,9 +194,19 @@ async fn download_auto(track: &Track, output_path: &PathBuf) -> Result<&'static 
         log::debug!("VK пропущен: VK_TOKEN не найден");
     }
 
-    // 4. YouTube (финальный fallback)
-    download_via_ytdlp(track, output_path, "ytsearch1").await?;
-    Ok("YT")
+    // 3. YouTube (большая база)
+    match download_via_ytdlp(track, output_path, "ytsearch1").await {
+        Ok(()) => return Ok("YT"),
+        Err(e) => log::debug!("YT не сработал для {}: {e:#}", track.search_query()),
+    }
+
+    // 4. Яндекс.Музыка (последний — может быть цензура)
+    if ym::is_available() {
+        ym::search_and_download(track, output_path).await?;
+        return Ok("YM");
+    }
+
+    bail!("Не удалось найти трек ни на одной платформе")
 }
 
 /// SC с перебором до 3 результатов (пропускает 30с превью).
@@ -261,9 +264,9 @@ async fn download_from_vk(token: &str, track: &Track, output_path: &PathBuf) -> 
 /// Источник скачивания.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
-    /// Автоматический выбор: YM → SC → VK → YT
+    /// Автоматический выбор: SC → VK → YT → YM
     Auto,
-    /// Яндекс.Музыка (оригинальное качество)
+    /// Яндекс.Музыка (может быть цензура)
     YandexMusic,
     /// Только SoundCloud
     SoundCloud,
